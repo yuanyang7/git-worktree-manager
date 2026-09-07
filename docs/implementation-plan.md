@@ -2,7 +2,21 @@
 
 ## Current implementation status
 
-Phase 1 is in progress. The repository now contains a dependency-light Rust `wtm` binary and reusable Git core that can discover canonical worktree paths through `git worktree list --porcelain -z`, parse Git status safely, report upstream and merge ancestry, collect commit and disk observations, and emit versioned JSON. The remaining Phase 1 work is broader fixture coverage and the TUI-facing presentation layer; lifecycle mutations, persistence, daemon IPC, and agent adapters remain future phases.
+Phase 1 read-only core and CLI are implemented. The repository contains a dependency-light Rust `wtm` binary and reusable Git core that can discover canonical worktree paths through `git worktree list --porcelain -z`, parse Git status safely, report upstream and merge ancestry, collect commit and disk observations, and emit versioned JSON. The TUI, lifecycle mutations, persistence, daemon IPC, and agent adapters remain future work.
+
+### Implemented in the current checkout
+
+- `wtm list [--repo PATH] [--base REF] [--json]` discovers every linked worktree without mutating the repository.
+- `wtm status PATH [--base REF] [--json]` reports one worktree in detail.
+- Git porcelain parsing covers canonical paths, branches, detached/bare/locked/prunable records, staged/unstaged/untracked/ignored/conflicted files, renames, upstream ahead/behind counts, local and remote ancestry, the last commit, and separate worktree-local/common-Git disk usage.
+- JSON output is explicitly versioned with `schema_version: 1` and includes an `observation_error` field when a worktree cannot be inspected completely.
+- `STATE` describes working-tree health (`clean`, `dirty`, `conflicted`, `unknown`, or `unavailable`); merge ancestry is reported independently in `MERGE` and `merge.classification`.
+- Existing worktrees expose filesystem modification time only as approximate evidence; durable `first_seen_at`, `created_at`, and `last_used_at` require the future inventory/lease layer.
+- Fixture-backed tests cover linked worktrees, canonical path normalization, dirty files, unique branch commits, local ancestry, remote-tracking ancestry, porcelain parsing, rename handling, and JSON escaping.
+
+### Handoff and next slice
+
+Validation currently passes with `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and a real CLI JSON parse. The next recommended implementation slice is Phase 2: define the SQLite inventory schema and event model, then add the repository-scoped mutation service behind a daemon boundary. Keep `GitRepository` read-only and make all create/lock/unlock/remove operations re-scan Git immediately before mutation.
 
 ## 1. Product direction
 
