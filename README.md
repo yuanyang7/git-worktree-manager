@@ -4,7 +4,7 @@ Worktree Manager is a local tool for safely creating, inspecting, assigning, and
 
 The first release is intended to be a terminal UI backed by a reusable core service. A desktop GUI can be added later without duplicating Git or process-management logic.
 
-The first read-only implementation slice is now available as the `wtm` command. It discovers worktrees through Git’s porcelain interface and reports changes, upstream divergence, merge ancestry, commit metadata, approximate filesystem time, and separate worktree/common-Git disk usage. See the [implementation plan](docs/implementation-plan.md) for the remaining lifecycle, agent, daemon, and TUI work.
+The read-only inspection core and the first guarded lifecycle slice are available as the `wtm` command. It discovers worktrees through Git’s porcelain interface, records repository/worktree facts in a local SQLite inventory, and provides collision-safe create, lock, unlock, cleanup-scan, and non-force remove operations. See the [implementation plan](docs/implementation-plan.md) for the remaining daemon, agent, and TUI work.
 
 ## Quick start
 
@@ -15,9 +15,16 @@ cargo run -- list
 cargo run -- list --json
 cargo run -- status /path/to/worktree
 cargo run -- status /path/to/worktree --base main --json
+cargo run -- create feature/auth --repo /path/to/repository --path /path/to/feature-auth
+cargo run -- cleanup scan --repo /path/to/repository --json
+cargo run -- remove /path/to/feature-auth --delete-branch --minimum-age-seconds 0
 ```
 
-`--json` output starts with `schema_version: 1` so scripts can depend on an explicit format version. The current phase is read-only: it does not create, lock, archive, remove, or mutate worktrees.
+`--json` output starts with `schema_version: 1` so scripts can depend on an explicit format version. Lifecycle commands use `.git/worktree-manager.sqlite3` by default. Pass `--db PATH` to place the inventory elsewhere.
+
+Creation accepts `--idempotency-key KEY`; repeated requests with the same key reuse the recorded worktree rather than creating another one. Cleanup and removal require a 24-hour minimum age by default; use `--minimum-age-seconds N` when a repository-specific policy calls for a different threshold. Removal is conservative: dirty, conflicted, locked, leased, in-use, unmerged, unavailable, or ambiguous worktrees are blocked, and branch deletion is a separate explicit `--delete-branch` action.
+
+The inventory links against the system SQLite library; macOS provides it, while Linux installations may need their distribution’s SQLite development package.
 
 ## Intended outcomes
 

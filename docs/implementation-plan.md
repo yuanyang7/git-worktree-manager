@@ -2,7 +2,7 @@
 
 ## Current implementation status
 
-Phase 1 read-only core and CLI are implemented. The repository contains a dependency-light Rust `wtm` binary and reusable Git core that can discover canonical worktree paths through `git worktree list --porcelain -z`, parse Git status safely, report upstream and merge ancestry, collect commit and disk observations, and emit versioned JSON. The TUI, lifecycle mutations, persistence, daemon IPC, and agent adapters remain future work.
+Phase 1 read-only core and the first Phase 2 lifecycle slice are implemented. The repository contains a dependency-light Rust `wtm` binary and reusable Git core that can discover canonical worktree paths through `git worktree list --porcelain -z`, parse Git status safely, report upstream and merge ancestry, collect commit and disk observations, and emit versioned JSON. A local SQLite inventory/event model and repository-scoped mutation service now cover collision-safe creation, Git locking, unlocking, cleanup assessment, and non-force removal. The daemon IPC, TUI, session/lease management, and agent adapters remain future work.
 
 ### Implemented in the current checkout
 
@@ -13,10 +13,14 @@ Phase 1 read-only core and CLI are implemented. The repository contains a depend
 - `STATE` describes working-tree health (`clean`, `dirty`, `conflicted`, `unknown`, or `unavailable`); merge ancestry is reported independently in `MERGE` and `merge.classification`.
 - Existing worktrees expose filesystem modification time only as approximate evidence; durable `first_seen_at`, `created_at`, and `last_used_at` require the future inventory/lease layer.
 - Fixture-backed tests cover linked worktrees, canonical path normalization, dirty files, unique branch commits, local ancestry, remote-tracking ancestry, porcelain parsing, rename handling, and JSON escaping.
+- SQLite inventory tables cover repositories, worktrees, sessions, leases, observations, reservations, schema migrations, and append-only lifecycle events. Tool-created worktrees receive an exact `created_at`; externally discovered worktrees retain their first-seen provenance.
+- `wtm create`, `wtm lock`, `wtm unlock`, `wtm cleanup scan`, and `wtm remove` use the mutation service. Creation re-scans Git, reserves path/branch identities in a transaction, supports idempotency keys, and re-scans after `git worktree add`; removal blocks dirty, conflicted, locked, leased, in-use, unmerged, unavailable, or ambiguous worktrees and only deletes a branch when explicitly requested. Cleanup enforces a 24-hour minimum age by default, and the CLI can override that policy explicitly.
+- Mutations hold both an in-process mutex and a Unix advisory lock in the common Git directory, while `lsof`-based working-directory checks conservatively classify active or uninspectable processes as `in-use` or `review`.
+- Unit and service tests cover SQLite schema/reconciliation, event recording, idempotent creation, safe removal, and dirty-worktree removal blocking. A real CLI smoke test covers create, lock, unlock, cleanup JSON, and remove with branch deletion.
 
 ### Handoff and next slice
 
-Validation currently passes with `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and a real CLI JSON parse. The next recommended implementation slice is Phase 2: define the SQLite inventory schema and event model, then add the repository-scoped mutation service behind a daemon boundary. Keep `GitRepository` read-only and make all create/lock/unlock/remove operations re-scan Git immediately before mutation.
+Validation on 2026-09-07 passes with `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, JSON parsing of the real CLI output, and a create/lock/unlock/cleanup/remove smoke test. The next recommended implementation slice is the daemon boundary: expose the service through local IPC, centralize the database writer, and add crash/retry and external-mutation reconciliation tests. Keep `GitRepository` read-only and preserve the immediate Git re-scan before every mutation.
 
 ## 1. Product direction
 

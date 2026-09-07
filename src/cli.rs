@@ -1,4 +1,8 @@
 use crate::git::{GitError, GitRepository, GitWorktreeStatus};
+use crate::json;
+use crate::service::{
+    CreateRequest, DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS, RepositoryService, ServiceError,
+};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -8,6 +12,7 @@ use std::path::{Path, PathBuf};
 pub enum CliError {
     Usage(String),
     Git(GitError),
+    Service(ServiceError),
     Io(String),
 }
 
@@ -16,6 +21,7 @@ impl fmt::Display for CliError {
         match self {
             Self::Usage(message) => write!(formatter, "{message}"),
             Self::Git(error) => error.fmt(formatter),
+            Self::Service(error) => error.fmt(formatter),
             Self::Io(message) => write!(formatter, "{message}"),
         }
     }
@@ -29,10 +35,42 @@ impl From<GitError> for CliError {
     }
 }
 
+impl From<ServiceError> for CliError {
+    fn from(error: ServiceError) -> Self {
+        Self::Service(error)
+    }
+}
+
 #[derive(Debug, Default)]
 struct OutputOptions {
     json: bool,
     base: Option<String>,
+}
+
+#[derive(Debug)]
+struct CreateCliOptions {
+    repo_path: PathBuf,
+    db_path: Option<PathBuf>,
+    request: CreateRequest,
+    json: bool,
+}
+
+#[derive(Debug, Default)]
+struct PathMutationOptions {
+    path: Option<PathBuf>,
+    db_path: Option<PathBuf>,
+    minimum_age_seconds: Option<i64>,
+    reason: Option<String>,
+    delete_branch: bool,
+    json: bool,
+}
+
+#[derive(Debug, Default)]
+struct RepositoryMutationOptions {
+    repo_path: PathBuf,
+    db_path: Option<PathBuf>,
+    minimum_age_seconds: Option<i64>,
+    json: bool,
 }
 
 pub fn run<I, T>(args: I) -> Result<(), CliError>
@@ -52,6 +90,11 @@ where
     match command {
         "list" => run_list(&args[1..]),
         "status" => run_status(&args[1..]),
+        "create" => run_create(&args[1..]),
+        "lock" => run_lock(&args[1..], true),
+        "unlock" => run_lock(&args[1..], false),
+        "remove" => run_remove(&args[1..]),
+        "cleanup" => run_cleanup(&args[1..]),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -94,6 +137,164 @@ fn run_status(args: &[String]) -> Result<(), CliError> {
         println!("{}", repository.to_json(&[status]));
     } else {
         print_status(&repository, &status);
+    }
+    Ok(())
+}
+
+fn run_create(args: &[String]) -> Result<(), CliError> {
+    let options = parse_create_options(args)?;
+    let repository = GitRepository::discover(&options.repo_path)?;
+    let db_path = options
+        .db_path
+        .unwrap_or_else(|| default_inventory_path(&repository));
+    let service = RepositoryService::open(repository, db_path)?;
+    let result = service.create(options.request)?;
+    if options.json {
+        println!("{}", result.to_json());
+    } else {
+        println!(
+            "{} worktree {} at {}",
+            if result.already_existed {
+                "Reused"
+            } else {
+                "Created"
+            },
+            result.worktree.branch.as_deref().unwrap_or("(detached)"),
+            result.worktree.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_lock(args: &[String], lock: bool) -> Result<(), CliError> {
+    let options = parse_path_mutation_options(args, if lock { "lock" } else { "unlock" })?;
+    if !lock && options.reason.is_some() {
+        return Err(CliError::Usage(format!(
+            "unlock does not accept --reason\n\n{}",
+            usage()
+        )));
+    }
+    let path = options.path.clone().ok_or_else(|| {
+        CliError::Usage(format!(
+            "{} requires a worktree path\n\n{}",
+            if lock { "lock" } else { "unlock" },
+            usage()
+        ))
+    })?;
+    let repository = GitRepository::discover(&path)?;
+    let db_path = options
+        .db_path
+        .unwrap_or_else(|| default_inventory_path(&repository));
+    let service = RepositoryService::open(repository, db_path)?;
+    let result = if lock {
+        service.lock(&path, options.reason.as_deref(), "cli")?
+    } else {
+        service.unlock(&path, "cli")?
+    };
+    if options.json {
+        println!("{}", result.to_json(if lock { "lock" } else { "unlock" }));
+    } else if result.already_in_requested_state {
+        println!(
+            "{} already {}: {}",
+            result.worktree.path.display(),
+            if lock { "locked" } else { "unlocked" },
+            result.worktree.lock_reason.as_deref().unwrap_or("")
+        );
+    } else {
+        println!(
+            "{} {}",
+            if lock { "Locked" } else { "Unlocked" },
+            result.worktree.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_remove(args: &[String]) -> Result<(), CliError> {
+    let options = parse_path_mutation_options(args, "remove")?;
+    let path = options.path.clone().ok_or_else(|| {
+        CliError::Usage(format!("remove requires a worktree path\n\n{}", usage()))
+    })?;
+    let repository = GitRepository::discover(&path)?;
+    let db_path = options
+        .db_path
+        .unwrap_or_else(|| default_inventory_path(&repository));
+    let service = RepositoryService::open_with_minimum_age(
+        repository,
+        db_path,
+        options
+            .minimum_age_seconds
+            .unwrap_or(DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS),
+    )?;
+    let result = service.remove(&path, options.delete_branch, "cli")?;
+    if options.json {
+        println!("{}", result.to_json());
+    } else {
+        println!("Removed worktree {}", result.path.display());
+        if result.branch_deleted
+            && let Some(branch) = result.branch
+        {
+            println!("Deleted branch {branch}");
+        }
+    }
+    Ok(())
+}
+
+fn run_cleanup(args: &[String]) -> Result<(), CliError> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return Err(CliError::Usage(format!(
+            "cleanup requires a subcommand\n\n{}",
+            usage()
+        )));
+    };
+    if subcommand != "scan" {
+        return Err(CliError::Usage(format!(
+            "unknown cleanup subcommand {subcommand:?}\n\n{}",
+            usage()
+        )));
+    }
+    let options = parse_repository_mutation_options(&args[1..], "cleanup scan")?;
+    let repository = GitRepository::discover(&options.repo_path)?;
+    let db_path = options
+        .db_path
+        .unwrap_or_else(|| default_inventory_path(&repository));
+    let service = RepositoryService::open_with_minimum_age(
+        repository,
+        db_path,
+        options
+            .minimum_age_seconds
+            .unwrap_or(DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS),
+    )?;
+    let candidates = service.cleanup_scan()?;
+    if options.json {
+        println!(
+            "{}",
+            json::Object::new()
+                .number("schema_version", 1)
+                .string("operation", "cleanup_scan")
+                .raw(
+                    "candidates",
+                    json::array(candidates.iter().map(|candidate| candidate.to_json())),
+                )
+                .finish()
+        );
+    } else {
+        println!("Cleanup candidates:");
+        for candidate in candidates {
+            let branch = candidate.branch.as_deref().unwrap_or("(detached)");
+            let blockers = if candidate.blockers.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", candidate.blockers.join(", "))
+            };
+            println!(
+                "  {:<8} {:<24} {:<20}{}",
+                candidate.classification,
+                truncate(branch, 24),
+                candidate.path.display(),
+                blockers
+            );
+        }
     }
     Ok(())
 }
@@ -170,6 +371,171 @@ fn parse_status_options(args: &[String]) -> Result<(PathBuf, OutputOptions), Cli
         CliError::Usage(format!("status requires a worktree path\n\n{}", usage()))
     })?;
     Ok((path, options))
+}
+
+fn parse_create_options(args: &[String]) -> Result<CreateCliOptions, CliError> {
+    let mut repo_path = PathBuf::from(".");
+    let mut db_path = None;
+    let mut branch = None;
+    let mut base = None;
+    let mut path = None;
+    let mut idempotency_key = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                index += 1;
+                repo_path = PathBuf::from(required_value(args, index, "--repo")?);
+            }
+            "--db" => {
+                index += 1;
+                db_path = Some(PathBuf::from(required_value(args, index, "--db")?));
+            }
+            "--base" => {
+                index += 1;
+                base = Some(required_value(args, index, "--base")?);
+            }
+            "--path" => {
+                index += 1;
+                path = Some(PathBuf::from(required_value(args, index, "--path")?));
+            }
+            "--idempotency-key" => {
+                index += 1;
+                idempotency_key = Some(required_value(args, index, "--idempotency-key")?);
+            }
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::Usage(format!(
+                    "unknown option {value:?} for create\n\n{}",
+                    usage()
+                )));
+            }
+            value => {
+                if branch.is_some() {
+                    return Err(CliError::Usage(format!(
+                        "create accepts one branch name\n\n{}",
+                        usage()
+                    )));
+                }
+                branch = Some(value.to_owned());
+            }
+        }
+        index += 1;
+    }
+    let branch = branch
+        .ok_or_else(|| CliError::Usage(format!("create requires a branch name\n\n{}", usage())))?;
+    let mut request = CreateRequest::new(branch);
+    request.base = base;
+    request.path = path;
+    request.idempotency_key = idempotency_key;
+    Ok(CreateCliOptions {
+        repo_path,
+        db_path,
+        request,
+        json,
+    })
+}
+
+fn parse_path_mutation_options(
+    args: &[String],
+    command: &str,
+) -> Result<PathMutationOptions, CliError> {
+    let mut options = PathMutationOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--db" => {
+                index += 1;
+                options.db_path = Some(PathBuf::from(required_value(args, index, "--db")?));
+            }
+            "--minimum-age-seconds" if command == "remove" => {
+                index += 1;
+                options.minimum_age_seconds =
+                    Some(required_integer(args, index, "--minimum-age-seconds")?);
+            }
+            "--reason" if command == "lock" => {
+                index += 1;
+                options.reason = Some(required_value(args, index, "--reason")?);
+            }
+            "--delete-branch" if command == "remove" => options.delete_branch = true,
+            "--json" => options.json = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::Usage(format!(
+                    "unknown option {value:?} for {command}\n\n{}",
+                    usage()
+                )));
+            }
+            value => {
+                if options.path.is_some() {
+                    return Err(CliError::Usage(format!(
+                        "{command} accepts one worktree path\n\n{}",
+                        usage()
+                    )));
+                }
+                options.path = Some(PathBuf::from(value));
+            }
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_repository_mutation_options(
+    args: &[String],
+    command: &str,
+) -> Result<RepositoryMutationOptions, CliError> {
+    let mut options = RepositoryMutationOptions {
+        repo_path: PathBuf::from("."),
+        ..RepositoryMutationOptions::default()
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                index += 1;
+                options.repo_path = PathBuf::from(required_value(args, index, "--repo")?);
+            }
+            "--db" => {
+                index += 1;
+                options.db_path = Some(PathBuf::from(required_value(args, index, "--db")?));
+            }
+            "--minimum-age-seconds" => {
+                index += 1;
+                options.minimum_age_seconds =
+                    Some(required_integer(args, index, "--minimum-age-seconds")?);
+            }
+            "--json" => options.json = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::Usage(format!(
+                    "unknown option {value:?} for {command}\n\n{}",
+                    usage()
+                )));
+            }
+            value => {
+                return Err(CliError::Usage(format!(
+                    "{command} does not accept positional argument {value:?}\n\n{}",
+                    usage()
+                )));
+            }
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn default_inventory_path(repository: &GitRepository) -> PathBuf {
+    repository.common_git_dir.join("worktree-manager.sqlite3")
+}
+
+fn required_integer(args: &[String], index: usize, option: &str) -> Result<i64, CliError> {
+    let value = required_value(args, index, option)?;
+    value.parse::<i64>().map_err(|error| {
+        CliError::Usage(format!(
+            "{option} requires an integer value, got {value:?}: {error}\n\n{}",
+            usage()
+        ))
+    })
 }
 
 fn required_value(args: &[String], index: usize, option: &str) -> Result<String, CliError> {
@@ -361,12 +727,12 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  wtm list [--repo PATH] [--base REF] [--json]\n  wtm status PATH [--base REF] [--json]\n  wtm --help\n  wtm --version"
+    "Usage:\n  wtm list [--repo PATH] [--base REF] [--json]\n  wtm status PATH [--base REF] [--json]\n  wtm create BRANCH [--repo PATH] [--base REF] [--path PATH] [--idempotency-key KEY] [--db PATH] [--json]\n  wtm lock PATH [--reason TEXT] [--db PATH] [--json]\n  wtm unlock PATH [--db PATH] [--json]\n  wtm cleanup scan [--repo PATH] [--db PATH] [--minimum-age-seconds N] [--json]\n  wtm remove PATH [--delete-branch] [--db PATH] [--minimum-age-seconds N] [--json]\n  wtm --help\n  wtm --version"
 }
 
 fn print_help() {
     println!(
-        "Worktree Manager\n\nRead-only Git worktree discovery and status inspection.\n\n{}",
+        "Worktree Manager\n\nGit worktree discovery, status inspection, and guarded lifecycle operations.\n\n{}",
         usage()
     );
 }
