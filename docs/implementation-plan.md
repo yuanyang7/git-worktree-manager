@@ -1,5 +1,9 @@
 # Worktree Manager implementation plan
 
+## Current implementation status
+
+Phase 1 is in progress. The repository now contains a dependency-light Rust `wtm` binary and reusable Git core that can discover canonical worktree paths through `git worktree list --porcelain -z`, parse Git status safely, report upstream and merge ancestry, collect commit and disk observations, and emit versioned JSON. The remaining Phase 1 work is broader fixture coverage and the TUI-facing presentation layer; lifecycle mutations, persistence, daemon IPC, and agent adapters remain future phases.
+
 ## 1. Product direction
 
 Build a local-first worktree control plane for developers running multiple coding agents against one repository. Start with a terminal UI (TUI), because it is fast to ship, works naturally beside agents, and avoids committing to a desktop framework before the workflows are validated. Keep all behavior behind a reusable core and local daemon so a native or web-based desktop GUI can be added later.

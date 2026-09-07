@@ -1,0 +1,17 @@
+[package]
+name = "worktree-manager"
+version = "0.1.0"
+edition = "2024"
+description = "A local-first control plane for Git worktrees used by coding agents"
+
+[[bin]]
+name = "wtm"
+path = "src/main.rs"
+
+[lib]
+name = "worktree_manager"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
