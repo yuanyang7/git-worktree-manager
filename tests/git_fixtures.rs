@@ -107,6 +107,14 @@ fn discovers_linked_worktrees_and_reports_dirty_files() {
     assert_eq!(feature_status.data.merge.merged_remotely, Some(true));
     assert!(feature_status.data.disk_usage.worktree_bytes > 0);
     assert!(feature_status.observation_error.is_none());
+
+    let main_path = fs::canonicalize(root).expect("main path should be canonicalizable");
+    let main_status = statuses
+        .iter()
+        .find(|status| status.worktree.path == main_path)
+        .expect("main worktree should be present");
+    assert_eq!(main_status.state(), "clean");
+    assert_eq!(main_status.data.merge.classification, "merged-locally");
 }
 
 #[test]

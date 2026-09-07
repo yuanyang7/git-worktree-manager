@@ -111,10 +111,6 @@ impl GitWorktreeStatus {
             "conflicted"
         } else if self.data.changes.dirty() {
             "dirty"
-        } else if self.data.merge.merged_locally == Some(true) {
-            "merged-locally"
-        } else if self.data.merge.merged_locally == Some(false) {
-            "unmerged"
         } else {
             "clean"
         }
