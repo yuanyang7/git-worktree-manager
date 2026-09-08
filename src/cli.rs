@@ -1,10 +1,13 @@
-use crate::daemon::{DaemonClient, DaemonConfig, DaemonError, DaemonServer, inventory_identity};
+use crate::daemon::{
+    DaemonClient, DaemonConfig, DaemonError, DaemonServer, clean_stale_socket, inventory_identity,
+};
 use crate::git::{GitError, GitRepository, GitWorktreeStatus};
 use crate::json;
 use crate::service::{CreateRequest, DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS, ServiceError};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -96,6 +99,12 @@ struct DaemonOptions {
     minimum_age_seconds: Option<i64>,
 }
 
+#[derive(Debug, Default)]
+struct DaemonCleanOptions {
+    repo_path: PathBuf,
+    socket_path: Option<PathBuf>,
+}
+
 pub fn run<I, T>(args: I) -> Result<(), CliError>
 where
     I: IntoIterator<Item = T>,
@@ -135,6 +144,9 @@ where
 }
 
 fn run_daemon(args: &[String]) -> Result<(), CliError> {
+    if args.first().is_some_and(|argument| argument == "clean") {
+        return run_daemon_clean(&args[1..]);
+    }
     let options = parse_daemon_options(args)?;
     let repository = GitRepository::discover(&options.repo_path)?;
     let db_path = options
@@ -148,6 +160,23 @@ fn run_daemon(args: &[String]) -> Result<(), CliError> {
         config.minimum_cleanup_age_seconds = minimum_age_seconds;
     }
     DaemonServer::open(config)?.serve_forever()?;
+    Ok(())
+}
+
+fn run_daemon_clean(args: &[String]) -> Result<(), CliError> {
+    let options = parse_daemon_clean_options(args)?;
+    let socket_path = match options.socket_path {
+        Some(path) => path,
+        None => {
+            let repository = GitRepository::discover(&options.repo_path)?;
+            default_socket_path(&repository)
+        }
+    };
+    if clean_stale_socket(&socket_path)? {
+        println!("Removed stale daemon socket {}", socket_path.display());
+    } else {
+        println!("No daemon socket at {}", socket_path.display());
+    }
     Ok(())
 }
 
@@ -624,6 +653,34 @@ fn parse_daemon_options(args: &[String]) -> Result<DaemonOptions, CliError> {
     Ok(options)
 }
 
+fn parse_daemon_clean_options(args: &[String]) -> Result<DaemonCleanOptions, CliError> {
+    let mut options = DaemonCleanOptions {
+        repo_path: PathBuf::from("."),
+        ..DaemonCleanOptions::default()
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                index += 1;
+                options.repo_path = PathBuf::from(required_value(args, index, "--repo")?);
+            }
+            "--socket" => {
+                index += 1;
+                options.socket_path = Some(PathBuf::from(required_value(args, index, "--socket")?));
+            }
+            value => {
+                return Err(CliError::Usage(format!(
+                    "unknown option {value:?} for daemon clean\n\n{}",
+                    usage()
+                )));
+            }
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
 fn default_inventory_path(repository: &GitRepository) -> PathBuf {
     repository.common_git_dir.join("worktree-manager.sqlite3")
 }
@@ -951,7 +1008,7 @@ fn daemon_client(
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| CliError::Io(format!("start local wtm daemon: {source}")))?;
 
@@ -970,8 +1027,9 @@ fn daemon_client(
                 thread::sleep(Duration::from_millis(50));
             }
             return Err(CliError::Io(format!(
-                "local wtm daemon exited before opening {} ({status})",
-                socket_path.display()
+                "local wtm daemon exited before opening {} ({status}){}",
+                socket_path.display(),
+                child_stderr_suffix(&mut child)
             )));
         }
         thread::sleep(Duration::from_millis(50));
@@ -979,9 +1037,26 @@ fn daemon_client(
     let _ = child.kill();
     let _ = child.wait();
     Err(CliError::Io(format!(
-        "timed out waiting for local wtm daemon at {}",
-        socket_path.display()
+        "timed out waiting for local wtm daemon at {}{}",
+        socket_path.display(),
+        child_stderr_suffix(&mut child)
     )))
+}
+
+fn child_stderr_suffix(child: &mut std::process::Child) -> String {
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut output = String::new();
+    if stderr.read_to_string(&mut output).is_err() {
+        return String::new();
+    }
+    let output = output.trim();
+    if output.is_empty() {
+        String::new()
+    } else {
+        format!(": {output}")
+    }
 }
 
 fn default_socket_path(repository: &GitRepository) -> PathBuf {
@@ -1211,7 +1286,7 @@ fn print_cleanup_result(
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  wtm list [--repo PATH] [--base REF] [--json]\n  wtm status PATH [--base REF] [--json]\n  wtm create BRANCH [--repo PATH] [--base REF] [--path PATH] [--idempotency-key KEY] [--db PATH] [--socket PATH] [--json]\n  wtm lock PATH [--reason TEXT] [--db PATH] [--socket PATH] [--json]\n  wtm unlock PATH [--db PATH] [--socket PATH] [--json]\n  wtm cleanup scan [--repo PATH] [--base REF] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm remove PATH [--repo PATH] [--delete-branch] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm daemon [--repo PATH] [--db PATH] [--socket PATH] [--minimum-age-seconds N]\n  wtm --help\n  wtm --version"
+    "Usage:\n  wtm list [--repo PATH] [--base REF] [--json]\n  wtm status PATH [--base REF] [--json]\n  wtm create BRANCH [--repo PATH] [--base REF] [--path PATH] [--idempotency-key KEY] [--db PATH] [--socket PATH] [--json]\n  wtm lock PATH [--reason TEXT] [--db PATH] [--socket PATH] [--json]\n  wtm unlock PATH [--db PATH] [--socket PATH] [--json]\n  wtm cleanup scan [--repo PATH] [--base REF] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm remove PATH [--repo PATH] [--delete-branch] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm daemon [--repo PATH] [--db PATH] [--socket PATH] [--minimum-age-seconds N]\n  wtm daemon clean [--repo PATH] [--socket PATH]\n  wtm --help\n  wtm --version"
 }
 
 fn print_help() {

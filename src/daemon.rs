@@ -1619,6 +1619,61 @@ fn set_socket_permissions(path: &Path) -> Result<(), DaemonError> {
     })
 }
 
+#[cfg(unix)]
+pub fn clean_stale_socket(path: &Path) -> Result<bool, DaemonError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(DaemonError::Io {
+                operation: format!("inspect daemon socket {}", path.display()),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(DaemonError::Io {
+            operation: format!("clean daemon socket {}", path.display()),
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "path exists but is not a Unix socket",
+            ),
+        });
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => Err(DaemonError::Io {
+            operation: format!("clean daemon socket {}", path.display()),
+            source: io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "daemon is running; refusing to remove its socket",
+            ),
+        }),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            fs::remove_file(path).map_err(|source| DaemonError::Io {
+                operation: format!("remove stale daemon socket {}", path.display()),
+                source,
+            })?;
+            Ok(true)
+        }
+        Err(source) => Err(DaemonError::Io {
+            operation: format!("inspect daemon socket {}", path.display()),
+            source,
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn clean_stale_socket(_path: &Path) -> Result<bool, DaemonError> {
+    Err(DaemonError::Unsupported)
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1629,7 +1684,9 @@ fn unix_now() -> i64 {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{DaemonClient, DaemonConfig, DaemonError, DaemonServer, is_retryable};
+    use super::{
+        DaemonClient, DaemonConfig, DaemonError, DaemonServer, clean_stale_socket, is_retryable,
+    };
     use crate::git::GitRepository;
     use crate::json;
     use std::fs;
@@ -1777,6 +1834,19 @@ mod tests {
             .expect("transport retry should succeed");
         assert_eq!(transport_attempts, 2);
         assert_eq!(result, success_response);
+    }
+
+    #[test]
+    fn cleans_missing_socket_and_rejects_non_socket_paths() {
+        let directory = temporary_directory();
+        let socket = directory.join("daemon.sock");
+        assert!(!clean_stale_socket(&socket).expect("missing socket is cleanable"));
+
+        fs::write(&socket, "not a socket").expect("fixture file should be written");
+        let error = clean_stale_socket(&socket).expect_err("regular files must not be removed");
+        assert!(error.to_string().contains("not a Unix socket"));
+
+        let _ = fs::remove_dir_all(directory);
     }
 
     fn temporary_directory() -> PathBuf {

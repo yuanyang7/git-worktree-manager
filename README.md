@@ -89,6 +89,14 @@ When using a custom socket, pass it to mutating commands too:
   --socket /tmp/wtm.sock
 ```
 
+To remove only a stale socket, use:
+
+```sh
+./target/release/wtm daemon clean --repo /path/to/repository
+```
+
+The command refuses to remove a socket that accepts connections and never deletes or resets the SQLite inventory. Pass `--socket PATH` when the daemon uses a custom socket. If automatic daemon startup fails, the CLI includes the daemon’s startup error in its message; running `wtm daemon` directly is useful for diagnosis.
+
 The daemon serves versioned JSON-lines requests over a Unix socket. Its request journal replays completed responses and retries interrupted requests by request ID. Startup reconciliation refreshes Git before accepting work, and sessions can register, heartbeat, acquire renewable exclusive leases, and release them. The session/lease backend is implemented for future adapters; user-facing `wtm agent` commands are not available yet. Use a short socket path on systems with strict Unix socket path limits.
 
 If a daemon crashes after Git has removed a worktree, retry the same command so the request journal can reconcile and replay it. If the worktree path no longer lets Git discover the repository, add `--repo PATH` to `wtm remove`. Multiple daemon processes sharing one inventory serialize their request journal through database-scoped locks. Mutations also verify the inventory identity and recover from replacement of the database file.
