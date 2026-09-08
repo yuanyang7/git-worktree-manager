@@ -9,7 +9,7 @@ Phase 1 read-only core and the Phase 2 lifecycle/daemon slice are implemented. T
 - `wtm list [--repo PATH] [--base REF] [--json]` discovers every linked worktree without mutating the repository.
 - `wtm status PATH [--base REF] [--json]` reports one worktree in detail.
 - Git porcelain parsing covers canonical paths, branches, detached/bare/locked/prunable records, staged/unstaged/untracked/ignored/conflicted files, renames, upstream ahead/behind counts, local and remote ancestry, the last commit, and separate worktree-local/common-Git disk usage.
-- JSON output is explicitly versioned with `schema_version: 1` and includes an `observation_error` field when a worktree cannot be inspected completely.
+- JSON output is explicitly versioned with `schema_version: 1` and includes an `observation_error` field when a worktree cannot be inspected completely; human-readable `wtm list` output includes the approximate UTC filesystem modification date.
 - `STATE` describes working-tree health (`clean`, `dirty`, `conflicted`, `unknown`, or `unavailable`); merge ancestry is reported independently in `MERGE` and `merge.classification`.
 - Existing worktrees expose filesystem modification time only as approximate evidence; durable `first_seen_at` and tool-created `created_at` are persisted, while registered session `last_seen_at` is the current durable activity signal.
 - Fixture-backed tests cover linked worktrees, canonical path normalization, dirty files, unique branch commits, local ancestry, remote-tracking ancestry, porcelain parsing, rename handling, and JSON escaping.

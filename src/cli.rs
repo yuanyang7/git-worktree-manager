@@ -674,8 +674,8 @@ fn print_list(repository: &GitRepository, statuses: &[GitWorktreeStatus]) {
     );
     println!();
     println!(
-        "{:<32} {:<20} {:<16} {:<16} {:<18} {:>10}",
-        "WORKTREE", "BRANCH", "STATE", "CHANGES", "MERGE", "SIZE"
+        "{:<32} {:<20} {:<16} {:<16} {:<18} {:<10} {:>10}",
+        "WORKTREE", "BRANCH", "STATE", "CHANGES", "MERGE", "MODIFIED", "SIZE"
     );
     for status in statuses {
         let path = display_worktree_path(&repository.root, &status.worktree.path);
@@ -697,13 +697,20 @@ fn print_list(repository: &GitRepository, statuses: &[GitWorktreeStatus]) {
                 .worktree_bytes
                 .saturating_add(status.data.disk_usage.git_common_bytes),
         );
+        let modified = status
+            .data
+            .time
+            .filesystem_modified_unix_seconds
+            .map(format_unix_date)
+            .unwrap_or_else(|| "unknown".to_owned());
         println!(
-            "{:<32} {:<20} {:<16} {:<16} {:<18} {:>10}",
+            "{:<32} {:<20} {:<16} {:<16} {:<18} {:<10} {:>10}",
             truncate(&path, 32),
             truncate(branch, 20),
             status.state(),
             truncate(&changes, 16),
             truncate(&merge, 18),
+            truncate(&modified, 10),
             size
         );
         if let Some(error) = &status.observation_error {
@@ -758,7 +765,10 @@ fn print_status(repository: &GitRepository, status: &GitWorktreeStatus) {
         format_bytes(status.data.disk_usage.git_common_bytes)
     );
     if let Some(modified) = status.data.time.filesystem_modified_unix_seconds {
-        println!("Filesystem modified (approx.): {modified}");
+        println!(
+            "Filesystem modified (approx., UTC): {}",
+            format_unix_date(modified)
+        );
     }
     if !status.data.changes.entries.is_empty() {
         println!();
@@ -818,6 +828,32 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+fn format_unix_date(seconds: i64) -> String {
+    const SECONDS_PER_DAY: i64 = 86_400;
+
+    // Howard Hinnant's civil_from_days algorithm, using UTC days since the
+    // Unix epoch. This avoids adding a date/time dependency for one display
+    // field and handles dates before 1970 as well.
+    let days = seconds.div_euclid(SECONDS_PER_DAY);
+    let shifted_days = days + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    } / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn daemon_client_if_available(
@@ -1164,11 +1200,18 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::format_bytes;
+    use super::{format_bytes, format_unix_date};
 
     #[test]
     fn formats_bytes_for_human_output() {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn formats_unix_dates_in_utc() {
+        assert_eq!(format_unix_date(-86_400), "1969-12-31");
+        assert_eq!(format_unix_date(0), "1970-01-01");
+        assert_eq!(format_unix_date(951_782_400), "2000-02-29");
     }
 }
