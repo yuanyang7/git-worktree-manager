@@ -6,11 +6,21 @@ The current checkout provides a command-line client, reusable Rust service, SQLi
 
 The tool discovers worktrees through Git’s porcelain interface, records repository/worktree facts in a local SQLite inventory, and provides collision-safe create, lock, unlock, cleanup-scan, and non-force remove operations. See the [implementation plan](docs/implementation-plan.md) for the remaining TUI and agent work.
 
-## Requirements and build
+## Requirements and installation
 
 You need Git and Rust/Cargo. The inventory links against the system SQLite library; macOS provides it, while Linux installations may need their distribution’s SQLite development package.
 
-From this repository:
+Install `wtm` from a checkout:
+
+```sh
+cd /path/to/git-worktree-manager
+cargo install --path .
+wtm --help
+```
+
+Cargo installs the executable in its binary directory, usually `~/.cargo/bin`; make sure that directory is on your `PATH`. Update an existing installation with `cargo install --path . --force`, or remove it with `cargo uninstall worktree-manager`.
+
+For a development build instead of a global installation:
 
 ```sh
 cargo build --release
