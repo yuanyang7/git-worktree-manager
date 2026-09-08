@@ -23,7 +23,7 @@ Phase 1 read-only core and the Phase 2 lifecycle/daemon slice are implemented. T
 
 ### Handoff and next slice
 
-Validation on 2026-09-07 passes with `cargo fmt --check`, 19 unit tests plus 2 Git-fixture integration tests, `cargo clippy --all-targets -- -D warnings`, `git diff --check`, and JSON parsing of real read-only CLI output. The restricted execution environment denies Unix-domain socket binding, so a live daemon socket smoke test remains to run on a normal host. The next recommended implementation slice is the TUI/service read model and provider-neutral session adapters. Keep `GitRepository` read-only, route writes through the daemon, and preserve the immediate Git re-scan before every mutation.
+Validation on 2026-09-07 passes with `cargo fmt --check`, 22 unit tests plus 2 Git-fixture integration tests, `cargo clippy --all-targets -- -D warnings`, `git diff --check`, and JSON parsing of real read-only CLI output. Automatic daemon startup now uses a bounded readiness timeout, normalizes accepted Unix connections before reading, logs worker failures, and removes a socket after terminating a failed child. The restricted execution environment denies Unix-domain socket binding, so a live daemon socket smoke test remains to run on a normal host. The next recommended implementation slice is the TUI/service read model and provider-neutral session adapters. Keep `GitRepository` read-only, route writes through the daemon, and preserve the immediate Git re-scan before every mutation.
 
 ## 1. Product direction
 

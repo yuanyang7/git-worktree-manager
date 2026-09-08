@@ -238,6 +238,10 @@ impl DaemonServer {
                     thread::spawn(move || {
                         let _connection_guard = ConnectionGuard(Arc::clone(&active_connections));
                         let mut stream = stream;
+                        if let Err(error) = stream.set_nonblocking(false) {
+                            eprintln!("wtm daemon could not configure client connection: {error}");
+                            return;
+                        }
                         let Ok(Some(first_byte)) = wait_for_request_byte(&mut stream) else {
                             return;
                         };
@@ -265,8 +269,12 @@ impl DaemonServer {
                             }
                             Ok((service, inventory_identity, request_lock_paths))
                         })();
-                        let Ok((service, inventory_identity, request_lock_paths)) = opened else {
-                            return;
+                        let (service, inventory_identity, request_lock_paths) = match opened {
+                            Ok(opened) => opened,
+                            Err(error) => {
+                                eprintln!("wtm daemon could not open request service: {error}");
+                                return;
+                            }
                         };
                         let server = Self {
                             service,
@@ -277,7 +285,11 @@ impl DaemonServer {
                             request_lock,
                             active_connections,
                         };
-                        let _ = server.handle_connection_with_prefix(stream, Some(first_byte));
+                        if let Err(error) =
+                            server.handle_connection_with_prefix(stream, Some(first_byte))
+                        {
+                            eprintln!("wtm daemon connection failed: {error}");
+                        }
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -836,20 +848,21 @@ fn read_request_line_with_prefix(
 
 #[cfg(unix)]
 fn wait_for_request_byte(stream: &mut UnixStream) -> io::Result<Option<u8>> {
-    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+    let deadline = Instant::now() + Duration::from_millis(250);
     let mut byte = [0u8; 1];
-    match stream.read(&mut byte) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(byte[0])),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-            ) =>
-        {
-            Ok(None)
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
         }
-        Err(error) => Err(error),
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => return Ok(Some(byte[0])),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -888,6 +901,7 @@ pub struct DaemonClient {
     socket_path: PathBuf,
     retries: u32,
     retry_delay: Duration,
+    request_timeout: Duration,
 }
 
 impl fmt::Debug for DaemonClient {
@@ -897,6 +911,7 @@ impl fmt::Debug for DaemonClient {
             .field("socket_path", &self.socket_path)
             .field("retries", &self.retries)
             .field("retry_delay", &self.retry_delay)
+            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -907,11 +922,17 @@ impl DaemonClient {
             socket_path: socket_path.into(),
             retries: DEFAULT_CLIENT_RETRIES,
             retry_delay: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(5),
         }
     }
 
     pub fn with_retries(mut self, retries: u32) -> Self {
         self.retries = retries;
+        self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -952,7 +973,13 @@ impl DaemonClient {
         method: &str,
         params_json: &str,
     ) -> Result<String, DaemonError> {
-        self.request_with_sender(request_id, method, params_json, send_once)
+        let request_timeout = self.request_timeout;
+        self.request_with_sender(
+            request_id,
+            method,
+            params_json,
+            move |socket_path, request| send_once(socket_path, request, request_timeout),
+        )
     }
 
     #[cfg(unix)]
@@ -1265,19 +1292,23 @@ fn open_request_lock(lock_path: &Path) -> Result<File, DaemonError> {
 }
 
 #[cfg(unix)]
-fn send_once(socket_path: &Path, request: &str) -> Result<String, DaemonError> {
+fn send_once(
+    socket_path: &Path,
+    request: &str,
+    request_timeout: Duration,
+) -> Result<String, DaemonError> {
     let mut stream = UnixStream::connect(socket_path).map_err(|source| DaemonError::Io {
         operation: format!("connect to daemon socket {}", socket_path.display()),
         source,
     })?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(request_timeout))
         .map_err(|source| DaemonError::Io {
             operation: "set daemon read timeout".to_owned(),
             source,
         })?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(request_timeout))
         .map_err(|source| DaemonError::Io {
             operation: "set daemon write timeout".to_owned(),
             source,
@@ -1293,7 +1324,7 @@ fn send_once(socket_path: &Path, request: &str) -> Result<String, DaemonError> {
         operation: "flush daemon request".to_owned(),
         source,
     })?;
-    let mut reader = DeadlineReader::new(&mut stream, Duration::from_secs(5));
+    let mut reader = DeadlineReader::new(&mut stream, request_timeout);
     match read_request_line(&mut reader) {
         Ok(Some(response)) => Ok(response),
         Ok(None) => Err(DaemonError::Io {

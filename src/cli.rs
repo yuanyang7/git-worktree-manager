@@ -11,7 +11,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const DAEMON_READINESS_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum CliError {
@@ -983,7 +986,10 @@ fn daemon_client(
         .map(PathBuf::from)
         .unwrap_or_else(|| default_socket_path(repository));
     let client = DaemonClient::new(&socket_path).with_retries(0);
-    if daemon_is_ready(&client, repository, db_path, minimum_age_seconds) {
+    let readiness_client = DaemonClient::new(&socket_path)
+        .with_retries(0)
+        .with_request_timeout(DAEMON_READINESS_TIMEOUT);
+    if daemon_is_ready(&readiness_client, repository, db_path, minimum_age_seconds) {
         return Ok(client);
     }
 
@@ -1012,34 +1018,45 @@ fn daemon_client(
         .spawn()
         .map_err(|source| CliError::Io(format!("start local wtm daemon: {source}")))?;
 
-    for _ in 0..100 {
-        if daemon_is_ready(&client, repository, db_path, minimum_age_seconds) {
+    let startup_deadline = Instant::now() + DAEMON_STARTUP_TIMEOUT;
+    loop {
+        if daemon_is_ready(&readiness_client, repository, db_path, minimum_age_seconds) {
             return Ok(client);
         }
         if let Some(status) = child
             .try_wait()
             .map_err(|source| CliError::Io(format!("check local wtm daemon startup: {source}")))?
         {
-            for _ in 0..10 {
-                if daemon_is_ready(&client, repository, db_path, minimum_age_seconds) {
+            let exit_grace_deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < exit_grace_deadline {
+                if daemon_is_ready(&readiness_client, repository, db_path, minimum_age_seconds) {
                     return Ok(client);
                 }
                 thread::sleep(Duration::from_millis(50));
             }
+            let stderr_suffix = child_stderr_suffix(&mut child);
+            let socket_suffix = failed_startup_socket_suffix(&socket_path);
             return Err(CliError::Io(format!(
-                "local wtm daemon exited before opening {} ({status}){}",
+                "local wtm daemon exited before opening {} ({status}){}{}",
                 socket_path.display(),
-                child_stderr_suffix(&mut child)
+                stderr_suffix,
+                socket_suffix,
             )));
+        }
+        if Instant::now() >= startup_deadline {
+            break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     let _ = child.kill();
     let _ = child.wait();
+    let stderr_suffix = child_stderr_suffix(&mut child);
+    let socket_suffix = failed_startup_socket_suffix(&socket_path);
     Err(CliError::Io(format!(
-        "timed out waiting for local wtm daemon at {}{}",
+        "timed out waiting for local wtm daemon at {}{}{}",
         socket_path.display(),
-        child_stderr_suffix(&mut child)
+        stderr_suffix,
+        socket_suffix,
     )))
 }
 
@@ -1056,6 +1073,13 @@ fn child_stderr_suffix(child: &mut std::process::Child) -> String {
         String::new()
     } else {
         format!(": {output}")
+    }
+}
+
+fn failed_startup_socket_suffix(path: &Path) -> String {
+    match clean_stale_socket(path) {
+        Ok(_) => String::new(),
+        Err(error) => format!("; could not clean failed daemon socket: {error}"),
     }
 }
 
