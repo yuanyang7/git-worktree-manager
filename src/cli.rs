@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DAEMON_READINESS_TIMEOUT: Duration = Duration::from_secs(1);
-const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub enum CliError {
