@@ -83,6 +83,7 @@ struct RepositoryMutationOptions {
     repo_path: PathBuf,
     db_path: Option<PathBuf>,
     socket_path: Option<PathBuf>,
+    base: Option<String>,
     minimum_age_seconds: Option<i64>,
     json: bool,
 }
@@ -321,6 +322,7 @@ fn run_cleanup(args: &[String]) -> Result<(), CliError> {
         .minimum_age_seconds
         .unwrap_or(DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS);
     let params = json::Object::new()
+        .optional_string("base", options.base.as_deref())
         .signed_number("minimum_age_seconds", minimum_age_seconds)
         .string("actor", "cli")
         .finish();
@@ -334,7 +336,7 @@ fn run_cleanup(args: &[String]) -> Result<(), CliError> {
         "cleanup_scan",
         &params,
     )?;
-    print_cleanup_result(&result_json, options.json)?;
+    print_cleanup_result(&result_json, options.json, options.base.as_deref())?;
     Ok(())
 }
 
@@ -556,6 +558,10 @@ fn parse_repository_mutation_options(
             "--socket" => {
                 index += 1;
                 options.socket_path = Some(PathBuf::from(required_value(args, index, "--socket")?));
+            }
+            "--base" => {
+                index += 1;
+                options.base = Some(required_value(args, index, "--base")?);
             }
             "--minimum-age-seconds" => {
                 index += 1;
@@ -1132,12 +1138,29 @@ fn print_remove_result(result_json: &str, json_output: bool) -> Result<(), CliEr
     Ok(())
 }
 
-fn print_cleanup_result(result_json: &str, json_output: bool) -> Result<(), CliError> {
+fn print_cleanup_result(
+    result_json: &str,
+    json_output: bool,
+    requested_base: Option<&str>,
+) -> Result<(), CliError> {
+    let result = daemon_result(result_json)?;
+    if let Some(requested_base) = requested_base {
+        let actual_base = result.optional_string("base").map_err(CliError::Io)?;
+        if actual_base != Some(requested_base) {
+            return Err(CliError::Io(format!(
+                "daemon did not apply cleanup base {requested_base:?}"
+            )));
+        }
+    }
     if json_output {
         println!("{result_json}");
         return Ok(());
     }
-    let result = daemon_result(result_json)?;
+    let base_suffix = result
+        .optional_string("base")
+        .map_err(CliError::Io)?
+        .map(|base| format!(" (base: {base})"))
+        .unwrap_or_default();
     let candidates = match result.object_field("candidates") {
         Some(json::Value::Array(candidates)) => candidates,
         _ => {
@@ -1146,7 +1169,7 @@ fn print_cleanup_result(result_json: &str, json_output: bool) -> Result<(), CliE
             ));
         }
     };
-    println!("Cleanup candidates:");
+    println!("Cleanup candidates{base_suffix}:");
     for candidate in candidates {
         let path = candidate.required_string("path").map_err(CliError::Io)?;
         let branch = candidate
@@ -1188,7 +1211,7 @@ fn print_cleanup_result(result_json: &str, json_output: bool) -> Result<(), CliE
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  wtm list [--repo PATH] [--base REF] [--json]\n  wtm status PATH [--base REF] [--json]\n  wtm create BRANCH [--repo PATH] [--base REF] [--path PATH] [--idempotency-key KEY] [--db PATH] [--socket PATH] [--json]\n  wtm lock PATH [--reason TEXT] [--db PATH] [--socket PATH] [--json]\n  wtm unlock PATH [--db PATH] [--socket PATH] [--json]\n  wtm cleanup scan [--repo PATH] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm remove PATH [--repo PATH] [--delete-branch] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm daemon [--repo PATH] [--db PATH] [--socket PATH] [--minimum-age-seconds N]\n  wtm --help\n  wtm --version"
+    "Usage:\n  wtm list [--repo PATH] [--base REF] [--json]\n  wtm status PATH [--base REF] [--json]\n  wtm create BRANCH [--repo PATH] [--base REF] [--path PATH] [--idempotency-key KEY] [--db PATH] [--socket PATH] [--json]\n  wtm lock PATH [--reason TEXT] [--db PATH] [--socket PATH] [--json]\n  wtm unlock PATH [--db PATH] [--socket PATH] [--json]\n  wtm cleanup scan [--repo PATH] [--base REF] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm remove PATH [--repo PATH] [--delete-branch] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm daemon [--repo PATH] [--db PATH] [--socket PATH] [--minimum-age-seconds N]\n  wtm --help\n  wtm --version"
 }
 
 fn print_help() {

@@ -951,6 +951,14 @@ impl RepositoryService {
         &self,
         minimum_cleanup_age_seconds: i64,
     ) -> Result<Vec<CleanupCandidate>, ServiceError> {
+        self.cleanup_scan_with_minimum_age_and_base(minimum_cleanup_age_seconds, None)
+    }
+
+    pub fn cleanup_scan_with_minimum_age_and_base(
+        &self,
+        minimum_cleanup_age_seconds: i64,
+        base_override: Option<&str>,
+    ) -> Result<Vec<CleanupCandidate>, ServiceError> {
         validate_cleanup_age(minimum_cleanup_age_seconds)?;
         let _guard = self.mutation_guard()?;
         let worktrees = self.repository.list_worktrees()?;
@@ -963,7 +971,7 @@ impl RepositoryService {
         worktrees
             .iter()
             .map(|worktree| {
-                let status = self.repository.inspect_worktree(worktree, None);
+                let status = self.repository.inspect_worktree(worktree, base_override);
                 let record = records_by_path
                     .get(&worktree.path.to_string_lossy().into_owned())
                     .copied();
@@ -1866,6 +1874,56 @@ mod tests {
         service
             .remove(&path, false, "test")
             .expect("released worktree should be removable");
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cleanup_scan_honors_base_override() {
+        let directory = temporary_directory();
+        let root = directory.join("repository");
+        initialize_repository(&root);
+        let path = directory.join("feature");
+        let repository = GitRepository::discover(&root).expect("repository discovered");
+        let service = RepositoryService::open_with_minimum_age(
+            repository,
+            directory.join("inventory.sqlite3"),
+            0,
+        )
+        .expect("service opened");
+        let mut create = CreateRequest::new("feature");
+        create.path = Some(path.clone());
+        service.create(create).expect("worktree created");
+
+        fs::write(path.join("feature.txt"), "feature\n").expect("feature file written");
+        run_git(&path, &["add", "feature.txt"]);
+        run_git(&path, &["commit", "-q", "-m", "feature work"]);
+        run_git(&root, &["branch", "dev", "feature"]);
+
+        let default_candidates = service
+            .cleanup_scan_with_minimum_age(0)
+            .expect("default cleanup scan should succeed");
+        let default_candidate = default_candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&path).expect("path canonical"))
+            .expect("feature candidate should be present");
+        assert_eq!(default_candidate.classification, "unsafe");
+        assert!(
+            default_candidate
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("unique commit"))
+        );
+
+        let dev_candidates = service
+            .cleanup_scan_with_minimum_age_and_base(0, Some("dev"))
+            .expect("dev cleanup scan should succeed");
+        let dev_candidate = dev_candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&path).expect("path canonical"))
+            .expect("feature candidate should be present");
+        assert_eq!(dev_candidate.classification, "eligible");
+        assert!(dev_candidate.blockers.is_empty());
 
         let _ = fs::remove_dir_all(directory);
     }

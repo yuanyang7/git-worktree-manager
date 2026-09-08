@@ -601,17 +601,21 @@ impl DaemonServer {
                 Ok(self.service.unlock(&path, actor)?.to_json("unlock"))
             }
             "cleanup_scan" => {
+                let base = params
+                    .optional_string("base")
+                    .map_err(DaemonError::Protocol)?;
                 let minimum_age_seconds =
                     requested_cleanup_age(params, self.service.minimum_cleanup_age_seconds())?;
                 Ok(json::Object::new()
                     .number("schema_version", PROTOCOL_VERSION as u64)
                     .string("operation", "cleanup_scan")
+                    .optional_string("base", base)
                     .signed_number("minimum_age_seconds", minimum_age_seconds)
                     .raw(
                         "candidates",
                         json::array(
                             self.service
-                                .cleanup_scan_with_minimum_age(minimum_age_seconds)?
+                                .cleanup_scan_with_minimum_age_and_base(minimum_age_seconds, base)?
                                 .iter()
                                 .map(|candidate| candidate.to_json()),
                         ),
@@ -1682,11 +1686,13 @@ mod tests {
 
         let cleanup_params = json::Object::new()
             .signed_number("minimum_age_seconds", 0)
+            .string("base", "main")
             .finish();
         let cleanup = server
             .handle_line(&request("cleanup-1", "cleanup_scan", &cleanup_params))
             .expect("cleanup scan should accept a per-request age");
         assert!(cleanup.contains("\"minimum_age_seconds\":0"));
+        assert!(cleanup.contains("\"base\":\"main\""));
         assert!(!cleanup.contains("minimum cleanup age is 86400s"));
 
         let register_params = json::Object::new()

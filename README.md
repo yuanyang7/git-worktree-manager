@@ -56,6 +56,7 @@ Inspect cleanup candidates and remove a worktree:
 
 ```sh
 ./target/release/wtm cleanup scan --repo /path/to/repository --json
+./target/release/wtm cleanup scan --repo /path/to/repository --base dev --json
 ./target/release/wtm remove /path/to/feature-auth --repo /path/to/repository
 ./target/release/wtm remove /path/to/feature-auth \
   --repo /path/to/repository \
@@ -67,7 +68,7 @@ Inspect cleanup candidates and remove a worktree:
 
 The human-readable list includes `MODIFIED`, an approximate UTC date derived from the worktree directory’s filesystem metadata. JSON output retains the raw Unix timestamp and its provenance under `time`.
 
-Creation accepts `--idempotency-key KEY`; repeated requests with the same key reuse the recorded worktree rather than creating another one. Cleanup and removal require a 24-hour minimum age by default; use `--minimum-age-seconds N` when a repository-specific policy calls for a different threshold. Removal is conservative: dirty, conflicted, locked, leased, in-use, unmerged, unavailable, or ambiguous worktrees are blocked, and branch deletion is a separate explicit `--delete-branch` action.
+Creation accepts `--idempotency-key KEY`; repeated requests with the same key reuse the recorded worktree rather than creating another one. Cleanup accepts `--base REF` to evaluate merge safety against a different integration ref, such as `dev`. Cleanup and removal require a 24-hour minimum age by default; use `--minimum-age-seconds N` when a repository-specific policy calls for a different threshold. Removal is conservative: dirty, conflicted, locked, leased, in-use, unmerged, unavailable, or ambiguous worktrees are blocked, and branch deletion is a separate explicit `--delete-branch` action.
 
 ## Daemon and crash recovery
 

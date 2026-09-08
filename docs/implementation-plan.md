@@ -14,7 +14,7 @@ Phase 1 read-only core and the Phase 2 lifecycle/daemon slice are implemented. T
 - Existing worktrees expose filesystem modification time only as approximate evidence; durable `first_seen_at` and tool-created `created_at` are persisted, while registered session `last_seen_at` is the current durable activity signal.
 - Fixture-backed tests cover linked worktrees, canonical path normalization, dirty files, unique branch commits, local ancestry, remote-tracking ancestry, porcelain parsing, rename handling, and JSON escaping.
 - SQLite inventory tables cover repositories, worktrees, sessions, leases, observations, reservations, schema migrations, and append-only lifecycle events. Tool-created worktrees receive an exact `created_at`; externally discovered worktrees retain their first-seen provenance.
-- `wtm create`, `wtm lock`, `wtm unlock`, `wtm cleanup scan`, and `wtm remove` use the mutation service. Creation re-scans Git, reserves path/branch identities in a transaction, supports idempotency keys, and re-scans after `git worktree add`; removal blocks dirty, conflicted, locked, leased, in-use, unmerged, unavailable, or ambiguous worktrees and only deletes a branch when explicitly requested. Cleanup enforces a 24-hour minimum age by default, and the CLI can override that policy explicitly.
+- `wtm create`, `wtm lock`, `wtm unlock`, `wtm cleanup scan`, and `wtm remove` use the mutation service. Creation re-scans Git, reserves path/branch identities in a transaction, supports idempotency keys, and re-scans after `git worktree add`; removal blocks dirty, conflicted, locked, leased, in-use, unmerged, unavailable, or ambiguous worktrees and only deletes a branch when explicitly requested. Cleanup enforces a 24-hour minimum age by default, and the CLI can override that policy or select a different merge base with `--base REF`.
 - Mutations hold both an in-process mutex and a Unix advisory lock in the common Git directory, while `lsof`-based working-directory checks conservatively classify active or uninspectable processes as `in-use` or `review`.
 - Unit and service tests cover SQLite schema/migration/reconciliation, event recording, idempotent creation, safe removal, dirty-worktree removal blocking, daemon request replay, and session/lease recovery. The read-only CLI JSON output is smoke-checked; socket-level daemon integration remains an environment-dependent verification step.
 - `wtm daemon` exposes the guarded service through a versioned JSON-lines Unix socket. Mutating CLI commands start or reuse that daemon (and accept `--socket PATH` for an explicitly managed socket), so the daemon is the single serialized database writer. It restricts the socket to the current user, reconciles Git on startup, journals request state, replays completed responses, and safely re-executes interrupted requests with the same request ID.
@@ -250,7 +250,7 @@ wtm agent launch <worktree> [--provider <name>]
 wtm agent attach <worktree>
 wtm agent send <worktree> <message>
 wtm lock|unlock <worktree>
-wtm cleanup scan [--json]
+wtm cleanup scan [--base REF] [--json]
 wtm remove <worktree> [--delete-branch]
 wtm doctor
 wtm tui
