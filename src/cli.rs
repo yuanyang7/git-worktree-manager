@@ -1,17 +1,20 @@
+use crate::daemon::{DaemonClient, DaemonConfig, DaemonError, DaemonServer, inventory_identity};
 use crate::git::{GitError, GitRepository, GitWorktreeStatus};
 use crate::json;
-use crate::service::{
-    CreateRequest, DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS, RepositoryService, ServiceError,
-};
+use crate::service::{CreateRequest, DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS, ServiceError};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub enum CliError {
     Usage(String),
     Git(GitError),
+    Daemon(DaemonError),
     Service(ServiceError),
     Io(String),
 }
@@ -21,6 +24,7 @@ impl fmt::Display for CliError {
         match self {
             Self::Usage(message) => write!(formatter, "{message}"),
             Self::Git(error) => error.fmt(formatter),
+            Self::Daemon(error) => error.fmt(formatter),
             Self::Service(error) => error.fmt(formatter),
             Self::Io(message) => write!(formatter, "{message}"),
         }
@@ -32,6 +36,12 @@ impl std::error::Error for CliError {}
 impl From<GitError> for CliError {
     fn from(error: GitError) -> Self {
         Self::Git(error)
+    }
+}
+
+impl From<DaemonError> for CliError {
+    fn from(error: DaemonError) -> Self {
+        Self::Daemon(error)
     }
 }
 
@@ -51,6 +61,7 @@ struct OutputOptions {
 struct CreateCliOptions {
     repo_path: PathBuf,
     db_path: Option<PathBuf>,
+    socket_path: Option<PathBuf>,
     request: CreateRequest,
     json: bool,
 }
@@ -58,7 +69,9 @@ struct CreateCliOptions {
 #[derive(Debug, Default)]
 struct PathMutationOptions {
     path: Option<PathBuf>,
+    repo_path: Option<PathBuf>,
     db_path: Option<PathBuf>,
+    socket_path: Option<PathBuf>,
     minimum_age_seconds: Option<i64>,
     reason: Option<String>,
     delete_branch: bool,
@@ -69,8 +82,17 @@ struct PathMutationOptions {
 struct RepositoryMutationOptions {
     repo_path: PathBuf,
     db_path: Option<PathBuf>,
+    socket_path: Option<PathBuf>,
     minimum_age_seconds: Option<i64>,
     json: bool,
+}
+
+#[derive(Debug, Default)]
+struct DaemonOptions {
+    repo_path: PathBuf,
+    db_path: Option<PathBuf>,
+    socket_path: Option<PathBuf>,
+    minimum_age_seconds: Option<i64>,
 }
 
 pub fn run<I, T>(args: I) -> Result<(), CliError>
@@ -95,6 +117,7 @@ where
         "unlock" => run_lock(&args[1..], false),
         "remove" => run_remove(&args[1..]),
         "cleanup" => run_cleanup(&args[1..]),
+        "daemon" => run_daemon(&args[1..]),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -108,6 +131,23 @@ where
             usage()
         ))),
     }
+}
+
+fn run_daemon(args: &[String]) -> Result<(), CliError> {
+    let options = parse_daemon_options(args)?;
+    let repository = GitRepository::discover(&options.repo_path)?;
+    let db_path = options
+        .db_path
+        .unwrap_or_else(|| default_inventory_path(&repository));
+    let socket_path = options
+        .socket_path
+        .unwrap_or_else(|| default_socket_path(&repository));
+    let mut config = DaemonConfig::new(repository, db_path, socket_path);
+    if let Some(minimum_age_seconds) = options.minimum_age_seconds {
+        config.minimum_cleanup_age_seconds = minimum_age_seconds;
+    }
+    DaemonServer::open(config)?.serve_forever()?;
+    Ok(())
 }
 
 fn run_list(args: &[String]) -> Result<(), CliError> {
@@ -147,22 +187,36 @@ fn run_create(args: &[String]) -> Result<(), CliError> {
     let db_path = options
         .db_path
         .unwrap_or_else(|| default_inventory_path(&repository));
-    let service = RepositoryService::open(repository, db_path)?;
-    let result = service.create(options.request)?;
-    if options.json {
-        println!("{}", result.to_json());
-    } else {
-        println!(
-            "{} worktree {} at {}",
-            if result.already_existed {
-                "Reused"
-            } else {
-                "Created"
-            },
-            result.worktree.branch.as_deref().unwrap_or("(detached)"),
-            result.worktree.path.display()
-        );
-    }
+    let path_text = options
+        .request
+        .path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let params = json::Object::new()
+        .string("branch", &options.request.branch)
+        .optional_string("base", options.request.base.as_deref())
+        .optional_string("path", path_text.as_deref())
+        .optional_string(
+            "idempotency_key",
+            options.request.idempotency_key.as_deref(),
+        )
+        .string("actor", &options.request.actor)
+        .finish();
+    let request_id = options
+        .request
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| next_request_id("create"));
+    let result_json = daemon_request_result(
+        &repository,
+        &db_path,
+        None,
+        options.socket_path.as_deref(),
+        &request_id,
+        "create",
+        &params,
+    )?;
+    print_create_result(&result_json, options.json)?;
     Ok(())
 }
 
@@ -185,28 +239,23 @@ fn run_lock(args: &[String], lock: bool) -> Result<(), CliError> {
     let db_path = options
         .db_path
         .unwrap_or_else(|| default_inventory_path(&repository));
-    let service = RepositoryService::open(repository, db_path)?;
-    let result = if lock {
-        service.lock(&path, options.reason.as_deref(), "cli")?
-    } else {
-        service.unlock(&path, "cli")?
-    };
-    if options.json {
-        println!("{}", result.to_json(if lock { "lock" } else { "unlock" }));
-    } else if result.already_in_requested_state {
-        println!(
-            "{} already {}: {}",
-            result.worktree.path.display(),
-            if lock { "locked" } else { "unlocked" },
-            result.worktree.lock_reason.as_deref().unwrap_or("")
-        );
-    } else {
-        println!(
-            "{} {}",
-            if lock { "Locked" } else { "Unlocked" },
-            result.worktree.path.display()
-        );
-    }
+    let params = json::Object::new()
+        .string("path", &path.to_string_lossy())
+        .optional_string("reason", options.reason.as_deref())
+        .string("actor", "cli")
+        .finish();
+    let operation = if lock { "lock" } else { "unlock" };
+    let request_id = next_request_id(operation);
+    let result_json = daemon_request_result(
+        &repository,
+        &db_path,
+        None,
+        options.socket_path.as_deref(),
+        &request_id,
+        operation,
+        &params,
+    )?;
+    print_lock_result(&result_json, lock, options.json)?;
     Ok(())
 }
 
@@ -215,28 +264,38 @@ fn run_remove(args: &[String]) -> Result<(), CliError> {
     let path = options.path.clone().ok_or_else(|| {
         CliError::Usage(format!("remove requires a worktree path\n\n{}", usage()))
     })?;
-    let repository = GitRepository::discover(&path)?;
+    let repository = match GitRepository::discover(&path) {
+        Ok(repository) => repository,
+        Err(error) => {
+            let Some(repo_path) = options.repo_path.as_ref() else {
+                return Err(error.into());
+            };
+            GitRepository::discover(repo_path)?
+        }
+    };
     let db_path = options
         .db_path
         .unwrap_or_else(|| default_inventory_path(&repository));
-    let service = RepositoryService::open_with_minimum_age(
-        repository,
-        db_path,
-        options
-            .minimum_age_seconds
-            .unwrap_or(DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS),
+    let minimum_age_seconds = options
+        .minimum_age_seconds
+        .unwrap_or(DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS);
+    let params = json::Object::new()
+        .string("path", &path.to_string_lossy())
+        .bool("delete_branch", options.delete_branch)
+        .signed_number("minimum_age_seconds", minimum_age_seconds)
+        .string("actor", "cli")
+        .finish();
+    let request_id = next_request_id("remove");
+    let result_json = daemon_request_result(
+        &repository,
+        &db_path,
+        Some(minimum_age_seconds),
+        options.socket_path.as_deref(),
+        &request_id,
+        "remove",
+        &params,
     )?;
-    let result = service.remove(&path, options.delete_branch, "cli")?;
-    if options.json {
-        println!("{}", result.to_json());
-    } else {
-        println!("Removed worktree {}", result.path.display());
-        if result.branch_deleted
-            && let Some(branch) = result.branch
-        {
-            println!("Deleted branch {branch}");
-        }
-    }
+    print_remove_result(&result_json, options.json)?;
     Ok(())
 }
 
@@ -258,44 +317,24 @@ fn run_cleanup(args: &[String]) -> Result<(), CliError> {
     let db_path = options
         .db_path
         .unwrap_or_else(|| default_inventory_path(&repository));
-    let service = RepositoryService::open_with_minimum_age(
-        repository,
-        db_path,
-        options
-            .minimum_age_seconds
-            .unwrap_or(DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS),
+    let minimum_age_seconds = options
+        .minimum_age_seconds
+        .unwrap_or(DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS);
+    let params = json::Object::new()
+        .signed_number("minimum_age_seconds", minimum_age_seconds)
+        .string("actor", "cli")
+        .finish();
+    let request_id = next_request_id("cleanup");
+    let result_json = daemon_request_result(
+        &repository,
+        &db_path,
+        Some(minimum_age_seconds),
+        options.socket_path.as_deref(),
+        &request_id,
+        "cleanup_scan",
+        &params,
     )?;
-    let candidates = service.cleanup_scan()?;
-    if options.json {
-        println!(
-            "{}",
-            json::Object::new()
-                .number("schema_version", 1)
-                .string("operation", "cleanup_scan")
-                .raw(
-                    "candidates",
-                    json::array(candidates.iter().map(|candidate| candidate.to_json())),
-                )
-                .finish()
-        );
-    } else {
-        println!("Cleanup candidates:");
-        for candidate in candidates {
-            let branch = candidate.branch.as_deref().unwrap_or("(detached)");
-            let blockers = if candidate.blockers.is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", candidate.blockers.join(", "))
-            };
-            println!(
-                "  {:<8} {:<24} {:<20}{}",
-                candidate.classification,
-                truncate(branch, 24),
-                candidate.path.display(),
-                blockers
-            );
-        }
-    }
+    print_cleanup_result(&result_json, options.json)?;
     Ok(())
 }
 
@@ -376,6 +415,7 @@ fn parse_status_options(args: &[String]) -> Result<(PathBuf, OutputOptions), Cli
 fn parse_create_options(args: &[String]) -> Result<CreateCliOptions, CliError> {
     let mut repo_path = PathBuf::from(".");
     let mut db_path = None;
+    let mut socket_path = None;
     let mut branch = None;
     let mut base = None;
     let mut path = None;
@@ -391,6 +431,10 @@ fn parse_create_options(args: &[String]) -> Result<CreateCliOptions, CliError> {
             "--db" => {
                 index += 1;
                 db_path = Some(PathBuf::from(required_value(args, index, "--db")?));
+            }
+            "--socket" => {
+                index += 1;
+                socket_path = Some(PathBuf::from(required_value(args, index, "--socket")?));
             }
             "--base" => {
                 index += 1;
@@ -432,6 +476,7 @@ fn parse_create_options(args: &[String]) -> Result<CreateCliOptions, CliError> {
     Ok(CreateCliOptions {
         repo_path,
         db_path,
+        socket_path,
         request,
         json,
     })
@@ -445,9 +490,17 @@ fn parse_path_mutation_options(
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--repo" if command == "remove" => {
+                index += 1;
+                options.repo_path = Some(PathBuf::from(required_value(args, index, "--repo")?));
+            }
             "--db" => {
                 index += 1;
                 options.db_path = Some(PathBuf::from(required_value(args, index, "--db")?));
+            }
+            "--socket" => {
+                index += 1;
+                options.socket_path = Some(PathBuf::from(required_value(args, index, "--socket")?));
             }
             "--minimum-age-seconds" if command == "remove" => {
                 index += 1;
@@ -500,6 +553,10 @@ fn parse_repository_mutation_options(
                 index += 1;
                 options.db_path = Some(PathBuf::from(required_value(args, index, "--db")?));
             }
+            "--socket" => {
+                index += 1;
+                options.socket_path = Some(PathBuf::from(required_value(args, index, "--socket")?));
+            }
             "--minimum-age-seconds" => {
                 index += 1;
                 options.minimum_age_seconds =
@@ -515,6 +572,43 @@ fn parse_repository_mutation_options(
             value => {
                 return Err(CliError::Usage(format!(
                     "{command} does not accept positional argument {value:?}\n\n{}",
+                    usage()
+                )));
+            }
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+fn parse_daemon_options(args: &[String]) -> Result<DaemonOptions, CliError> {
+    let mut options = DaemonOptions {
+        repo_path: PathBuf::from("."),
+        ..DaemonOptions::default()
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                index += 1;
+                options.repo_path = PathBuf::from(required_value(args, index, "--repo")?);
+            }
+            "--db" => {
+                index += 1;
+                options.db_path = Some(PathBuf::from(required_value(args, index, "--db")?));
+            }
+            "--socket" => {
+                index += 1;
+                options.socket_path = Some(PathBuf::from(required_value(args, index, "--socket")?));
+            }
+            "--minimum-age-seconds" => {
+                index += 1;
+                options.minimum_age_seconds =
+                    Some(required_integer(args, index, "--minimum-age-seconds")?);
+            }
+            value => {
+                return Err(CliError::Usage(format!(
+                    "unknown option {value:?} for daemon\n\n{}",
                     usage()
                 )));
             }
@@ -726,8 +820,339 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn daemon_client_if_available(
+    repository: &GitRepository,
+    db_path: &Path,
+    minimum_age_seconds: Option<i64>,
+    requested_socket_path: Option<&Path>,
+) -> Result<DaemonClient, CliError> {
+    daemon_client(
+        repository,
+        db_path,
+        minimum_age_seconds,
+        requested_socket_path,
+    )
+}
+
+fn daemon_request_result(
+    repository: &GitRepository,
+    db_path: &Path,
+    minimum_age_seconds: Option<i64>,
+    requested_socket_path: Option<&Path>,
+    request_id: &str,
+    method: &str,
+    params_json: &str,
+) -> Result<String, CliError> {
+    let client = daemon_client_if_available(
+        repository,
+        db_path,
+        minimum_age_seconds,
+        requested_socket_path,
+    )?;
+    match client.request_result(request_id, method, params_json) {
+        Ok(result) => Ok(result),
+        Err(error) if daemon_error_is_retryable(&error) => {
+            let restarted_client = daemon_client(
+                repository,
+                db_path,
+                minimum_age_seconds,
+                requested_socket_path,
+            )?;
+            restarted_client
+                .request_result(request_id, method, params_json)
+                .map_err(CliError::Daemon)
+        }
+        Err(error) => Err(CliError::Daemon(error)),
+    }
+}
+
+fn daemon_error_is_retryable(error: &DaemonError) -> bool {
+    match error {
+        DaemonError::Io { .. } | DaemonError::Protocol(_) => true,
+        DaemonError::Remote { code, .. } => code == "inventory_replaced",
+        _ => false,
+    }
+}
+
+fn daemon_client(
+    repository: &GitRepository,
+    db_path: &Path,
+    minimum_age_seconds: Option<i64>,
+    requested_socket_path: Option<&Path>,
+) -> Result<DaemonClient, CliError> {
+    let socket_path = requested_socket_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_socket_path(repository));
+    let client = DaemonClient::new(&socket_path).with_retries(0);
+    if daemon_is_ready(&client, repository, db_path, minimum_age_seconds) {
+        return Ok(client);
+    }
+
+    let executable = std::env::current_exe().map_err(|source| {
+        CliError::Io(format!(
+            "resolve wtm executable for daemon startup: {source}"
+        ))
+    })?;
+    let mut child = Command::new(executable)
+        .arg("daemon")
+        .arg("--repo")
+        .arg(&repository.root)
+        .arg("--db")
+        .arg(db_path)
+        .arg("--socket")
+        .arg(&socket_path)
+        .arg("--minimum-age-seconds")
+        .arg(
+            minimum_age_seconds
+                .unwrap_or(DEFAULT_CLEANUP_MINIMUM_AGE_SECONDS)
+                .to_string(),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| CliError::Io(format!("start local wtm daemon: {source}")))?;
+
+    for _ in 0..100 {
+        if daemon_is_ready(&client, repository, db_path, minimum_age_seconds) {
+            return Ok(client);
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| CliError::Io(format!("check local wtm daemon startup: {source}")))?
+        {
+            for _ in 0..10 {
+                if daemon_is_ready(&client, repository, db_path, minimum_age_seconds) {
+                    return Ok(client);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            return Err(CliError::Io(format!(
+                "local wtm daemon exited before opening {} ({status})",
+                socket_path.display()
+            )));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(CliError::Io(format!(
+        "timed out waiting for local wtm daemon at {}",
+        socket_path.display()
+    )))
+}
+
+fn default_socket_path(repository: &GitRepository) -> PathBuf {
+    let conventional = repository.common_git_dir.join("worktree-manager.sock");
+    if !socket_path_too_long(&conventional) {
+        return conventional;
+    }
+
+    let hash = socket_path_hash(&repository.common_git_dir);
+    let filename = format!("wtm-{hash:016x}.sock");
+    let temporary = std::env::temp_dir().join(&filename);
+    if !socket_path_too_long(&temporary) {
+        return temporary;
+    }
+    PathBuf::from("/tmp").join(filename)
+}
+
+#[cfg(unix)]
+fn socket_path_too_long(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().len() >= 100
+}
+
+#[cfg(not(unix))]
+fn socket_path_too_long(_path: &Path) -> bool {
+    false
+}
+
+fn socket_path_hash(path: &Path) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn daemon_is_ready(
+    client: &DaemonClient,
+    repository: &GitRepository,
+    db_path: &Path,
+    _minimum_age_seconds: Option<i64>,
+) -> bool {
+    let Ok(response) = client.request(&next_request_id("ping"), "ping", "{}") else {
+        return false;
+    };
+    let Ok(response) = json::parse(&response) else {
+        return false;
+    };
+    let Some(result) = response.object_field("result") else {
+        return false;
+    };
+    let Ok(root) = result.required_string("repository_root") else {
+        return false;
+    };
+    let Ok(inventory_path) = result.required_string("inventory_path") else {
+        return false;
+    };
+    let Ok(actual_identity) = result.required_string("inventory_identity") else {
+        return false;
+    };
+    let Ok(expected_identity) = inventory_identity(db_path) else {
+        return false;
+    };
+    let expected_db = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let actual_db =
+        fs::canonicalize(inventory_path).unwrap_or_else(|_| PathBuf::from(inventory_path));
+    root == repository.root.to_string_lossy()
+        && actual_db == expected_db
+        && actual_identity == expected_identity
+}
+
+fn next_request_id(operation: &str) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("cli-{operation}-{}-{timestamp}", std::process::id())
+}
+
+fn daemon_result(result_json: &str) -> Result<json::Value, CliError> {
+    json::parse(result_json).map_err(|error| CliError::Io(error.to_string()))
+}
+
+fn print_create_result(result_json: &str, json_output: bool) -> Result<(), CliError> {
+    if json_output {
+        println!("{result_json}");
+        return Ok(());
+    }
+    let result = daemon_result(result_json)?;
+    let path = result.required_string("path").map_err(CliError::Io)?;
+    let branch = result
+        .optional_string("branch")
+        .map_err(CliError::Io)?
+        .unwrap_or("(detached)");
+    let already_existed = result
+        .optional_bool("already_existed")
+        .map_err(CliError::Io)?
+        .unwrap_or(false);
+    println!(
+        "{} worktree {} at {}",
+        if already_existed { "Reused" } else { "Created" },
+        branch,
+        path
+    );
+    Ok(())
+}
+
+fn print_lock_result(result_json: &str, lock: bool, json_output: bool) -> Result<(), CliError> {
+    if json_output {
+        println!("{result_json}");
+        return Ok(());
+    }
+    let result = daemon_result(result_json)?;
+    let path = result.required_string("path").map_err(CliError::Io)?;
+    let already = result
+        .optional_bool("already_in_requested_state")
+        .map_err(CliError::Io)?
+        .unwrap_or(false);
+    if already {
+        println!(
+            "{} already {}: {}",
+            path,
+            if lock { "locked" } else { "unlocked" },
+            result
+                .optional_string("lock_reason")
+                .map_err(CliError::Io)?
+                .unwrap_or("")
+        );
+    } else {
+        println!("{} {}", if lock { "Locked" } else { "Unlocked" }, path);
+    }
+    Ok(())
+}
+
+fn print_remove_result(result_json: &str, json_output: bool) -> Result<(), CliError> {
+    if json_output {
+        println!("{result_json}");
+        return Ok(());
+    }
+    let result = daemon_result(result_json)?;
+    let path = result.required_string("path").map_err(CliError::Io)?;
+    println!("Removed worktree {path}");
+    if result
+        .optional_bool("branch_deleted")
+        .map_err(CliError::Io)?
+        .unwrap_or(false)
+        && let Some(branch) = result.optional_string("branch").map_err(CliError::Io)?
+    {
+        println!("Deleted branch {branch}");
+    }
+    Ok(())
+}
+
+fn print_cleanup_result(result_json: &str, json_output: bool) -> Result<(), CliError> {
+    if json_output {
+        println!("{result_json}");
+        return Ok(());
+    }
+    let result = daemon_result(result_json)?;
+    let candidates = match result.object_field("candidates") {
+        Some(json::Value::Array(candidates)) => candidates,
+        _ => {
+            return Err(CliError::Io(
+                "daemon cleanup response has no candidates array".to_owned(),
+            ));
+        }
+    };
+    println!("Cleanup candidates:");
+    for candidate in candidates {
+        let path = candidate.required_string("path").map_err(CliError::Io)?;
+        let branch = candidate
+            .optional_string("branch")
+            .map_err(CliError::Io)?
+            .unwrap_or("(detached)");
+        let classification = candidate
+            .required_string("classification")
+            .map_err(CliError::Io)?;
+        let blockers = match candidate.object_field("blockers") {
+            Some(json::Value::Array(blockers)) => blockers
+                .iter()
+                .map(|blocker| match blocker {
+                    json::Value::String(blocker) => Ok(blocker.as_str()),
+                    _ => Err("daemon cleanup blocker is not a string"),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|message| CliError::Io(message.to_owned()))?,
+            _ => {
+                return Err(CliError::Io(
+                    "daemon cleanup candidate has no blockers array".to_owned(),
+                ));
+            }
+        };
+        let blockers = if blockers.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", blockers.join(", "))
+        };
+        println!(
+            "  {:<8} {:<24} {:<20}{}",
+            classification,
+            truncate(branch, 24),
+            path,
+            blockers
+        );
+    }
+    Ok(())
+}
+
 fn usage() -> &'static str {
-    "Usage:\n  wtm list [--repo PATH] [--base REF] [--json]\n  wtm status PATH [--base REF] [--json]\n  wtm create BRANCH [--repo PATH] [--base REF] [--path PATH] [--idempotency-key KEY] [--db PATH] [--json]\n  wtm lock PATH [--reason TEXT] [--db PATH] [--json]\n  wtm unlock PATH [--db PATH] [--json]\n  wtm cleanup scan [--repo PATH] [--db PATH] [--minimum-age-seconds N] [--json]\n  wtm remove PATH [--delete-branch] [--db PATH] [--minimum-age-seconds N] [--json]\n  wtm --help\n  wtm --version"
+    "Usage:\n  wtm list [--repo PATH] [--base REF] [--json]\n  wtm status PATH [--base REF] [--json]\n  wtm create BRANCH [--repo PATH] [--base REF] [--path PATH] [--idempotency-key KEY] [--db PATH] [--socket PATH] [--json]\n  wtm lock PATH [--reason TEXT] [--db PATH] [--socket PATH] [--json]\n  wtm unlock PATH [--db PATH] [--socket PATH] [--json]\n  wtm cleanup scan [--repo PATH] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm remove PATH [--repo PATH] [--delete-branch] [--db PATH] [--socket PATH] [--minimum-age-seconds N] [--json]\n  wtm daemon [--repo PATH] [--db PATH] [--socket PATH] [--minimum-age-seconds N]\n  wtm --help\n  wtm --version"
 }
 
 fn print_help() {

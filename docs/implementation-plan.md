@@ -2,7 +2,7 @@
 
 ## Current implementation status
 
-Phase 1 read-only core and the first Phase 2 lifecycle slice are implemented. The repository contains a dependency-light Rust `wtm` binary and reusable Git core that can discover canonical worktree paths through `git worktree list --porcelain -z`, parse Git status safely, report upstream and merge ancestry, collect commit and disk observations, and emit versioned JSON. A local SQLite inventory/event model and repository-scoped mutation service now cover collision-safe creation, Git locking, unlocking, cleanup assessment, and non-force removal. The daemon IPC, TUI, session/lease management, and agent adapters remain future work.
+Phase 1 read-only core and the Phase 2 lifecycle/daemon slice are implemented. The repository contains a dependency-light Rust `wtm` binary and reusable Git core that can discover canonical worktree paths through `git worktree list --porcelain -z`, parse Git status safely, report upstream and merge ancestry, collect commit and disk observations, and emit versioned JSON. A local SQLite inventory/event model and repository-scoped mutation service cover collision-safe creation, Git locking, unlocking, cleanup assessment, non-force removal, daemon request replay, session registration, and renewable leases. The TUI and agent adapters remain future work.
 
 ### Implemented in the current checkout
 
@@ -11,16 +11,19 @@ Phase 1 read-only core and the first Phase 2 lifecycle slice are implemented. Th
 - Git porcelain parsing covers canonical paths, branches, detached/bare/locked/prunable records, staged/unstaged/untracked/ignored/conflicted files, renames, upstream ahead/behind counts, local and remote ancestry, the last commit, and separate worktree-local/common-Git disk usage.
 - JSON output is explicitly versioned with `schema_version: 1` and includes an `observation_error` field when a worktree cannot be inspected completely.
 - `STATE` describes working-tree health (`clean`, `dirty`, `conflicted`, `unknown`, or `unavailable`); merge ancestry is reported independently in `MERGE` and `merge.classification`.
-- Existing worktrees expose filesystem modification time only as approximate evidence; durable `first_seen_at`, `created_at`, and `last_used_at` require the future inventory/lease layer.
+- Existing worktrees expose filesystem modification time only as approximate evidence; durable `first_seen_at` and tool-created `created_at` are persisted, while registered session `last_seen_at` is the current durable activity signal.
 - Fixture-backed tests cover linked worktrees, canonical path normalization, dirty files, unique branch commits, local ancestry, remote-tracking ancestry, porcelain parsing, rename handling, and JSON escaping.
 - SQLite inventory tables cover repositories, worktrees, sessions, leases, observations, reservations, schema migrations, and append-only lifecycle events. Tool-created worktrees receive an exact `created_at`; externally discovered worktrees retain their first-seen provenance.
 - `wtm create`, `wtm lock`, `wtm unlock`, `wtm cleanup scan`, and `wtm remove` use the mutation service. Creation re-scans Git, reserves path/branch identities in a transaction, supports idempotency keys, and re-scans after `git worktree add`; removal blocks dirty, conflicted, locked, leased, in-use, unmerged, unavailable, or ambiguous worktrees and only deletes a branch when explicitly requested. Cleanup enforces a 24-hour minimum age by default, and the CLI can override that policy explicitly.
 - Mutations hold both an in-process mutex and a Unix advisory lock in the common Git directory, while `lsof`-based working-directory checks conservatively classify active or uninspectable processes as `in-use` or `review`.
-- Unit and service tests cover SQLite schema/reconciliation, event recording, idempotent creation, safe removal, and dirty-worktree removal blocking. A real CLI smoke test covers create, lock, unlock, cleanup JSON, and remove with branch deletion.
+- Unit and service tests cover SQLite schema/migration/reconciliation, event recording, idempotent creation, safe removal, dirty-worktree removal blocking, daemon request replay, and session/lease recovery. The read-only CLI JSON output is smoke-checked; socket-level daemon integration remains an environment-dependent verification step.
+- `wtm daemon` exposes the guarded service through a versioned JSON-lines Unix socket. Mutating CLI commands start or reuse that daemon (and accept `--socket PATH` for an explicitly managed socket), so the daemon is the single serialized database writer. It restricts the socket to the current user, reconciles Git on startup, journals request state, replays completed responses, and safely re-executes interrupted requests with the same request ID.
+- Cleanup and removal carry the effective minimum-age policy in each request, so an already-running daemon can safely serve explicit CLI overrides without a second socket owner. Definitive application errors are returned immediately; only transport or protocol uncertainty is retried with the same request ID.
+- Session registration is idempotent by session ID, stores provider/process/terminal identifiers, renews last-seen timestamps, and can acquire a worktree lease. Lease ownership is exclusive per worktree, expires conservatively, renews on heartbeat, releases on session shutdown, and blocks cleanup while active.
 
 ### Handoff and next slice
 
-Validation on 2026-09-07 passes with `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, JSON parsing of the real CLI output, and a create/lock/unlock/cleanup/remove smoke test. The next recommended implementation slice is the daemon boundary: expose the service through local IPC, centralize the database writer, and add crash/retry and external-mutation reconciliation tests. Keep `GitRepository` read-only and preserve the immediate Git re-scan before every mutation.
+Validation on 2026-09-07 passes with `cargo fmt --check`, 19 unit tests plus 2 Git-fixture integration tests, `cargo clippy --all-targets -- -D warnings`, `git diff --check`, and JSON parsing of real read-only CLI output. The restricted execution environment denies Unix-domain socket binding, so a live daemon socket smoke test remains to run on a normal host. The next recommended implementation slice is the TUI/service read model and provider-neutral session adapters. Keep `GitRepository` read-only, route writes through the daemon, and preserve the immediate Git re-scan before every mutation.
 
 ## 1. Product direction
 
@@ -280,7 +283,8 @@ Exit criterion: `wtm list` and `wtm status` accurately describe all fixtures wit
 - Add daemon, SQLite schema/migrations, repository mutexes, reconciliation, and event log.
 - Implement create, lock, unlock, move, and non-force remove.
 - Implement safety policy and dry-run cleanup reports.
-- Add crash/retry tests and external-mutation reconciliation tests.
+- Add JSON-lines Unix IPC, a single daemon database writer, request journaling/replay, crash-safe create retries, and external-mutation reconciliation tests.
+- Implement session registration, heartbeat, exclusive renewable leases, and stale-session cleanup blockers.
 
 Exit criterion: concurrent creation cannot duplicate a path or branch, and unsafe removal is blocked in tests.
 

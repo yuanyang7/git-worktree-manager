@@ -1,7 +1,7 @@
 use crate::git::{GitRepository, GitWorktree};
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::raw::{c_char, c_int, c_uchar, c_void};
 use std::path::{Path, PathBuf};
@@ -187,6 +187,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS reservations_idempotency_key
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime('%s', 'now'));
 "#;
 
+const MIGRATION_2_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS requests (
+    id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    state TEXT NOT NULL,
+    response_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+UPDATE leases SET state = 'expired', renewed_at = strftime('%s', 'now')
+ WHERE state = 'active'
+   AND id NOT IN (
+       SELECT MAX(id) FROM leases WHERE state = 'active' GROUP BY worktree_id
+   );
+
+CREATE UNIQUE INDEX IF NOT EXISTS leases_active_worktree
+    ON leases(worktree_id)
+    WHERE state = 'active';
+
+INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+VALUES (2, strftime('%s', 'now'));
+"#;
+
 #[derive(Debug)]
 pub enum InventoryError {
     Io {
@@ -270,6 +294,16 @@ pub struct EventInput<'a> {
     pub details_json: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EventMetadata<'a> {
+    pub repository_id: i64,
+    pub worktree_id: Option<i64>,
+    pub occurred_at: i64,
+    pub actor: &'a str,
+    pub action: &'a str,
+    pub result: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReservationRecord {
     pub id: i64,
@@ -283,8 +317,101 @@ pub struct ReservationRecord {
     pub completed_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub id: String,
+    pub worktree_id: i64,
+    pub provider: String,
+    pub provider_session_id: Option<String>,
+    pub pid: Option<i64>,
+    pub process_started_at: Option<i64>,
+    pub terminal_metadata: Option<String>,
+    pub state: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRecord {
+    pub id: i64,
+    pub worktree_id: i64,
+    pub session_id: String,
+    pub acquired_at: i64,
+    pub renewed_at: i64,
+    pub expires_at: i64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestRecord {
+    pub id: String,
+    pub operation: String,
+    pub state: String,
+    pub response_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SessionInput<'a> {
+    pub id: &'a str,
+    pub worktree_id: i64,
+    pub provider: &'a str,
+    pub provider_session_id: Option<&'a str>,
+    pub pid: Option<i64>,
+    pub process_started_at: Option<i64>,
+    pub terminal_metadata: Option<&'a str>,
+    pub now: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLeaseResult {
+    pub session: SessionRecord,
+    pub lease: Option<LeaseRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InventoryFileIdentity {
+    #[cfg(target_os = "macos")]
+    Mac {
+        device: u64,
+        inode: u64,
+        birth_time: i64,
+        birth_time_nanoseconds: i64,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    Unix {
+        device: u64,
+        inode: u64,
+        change_time: i64,
+        change_time_nanoseconds: i64,
+    },
+    #[cfg(not(unix))]
+    Path(PathBuf),
+}
+
+impl InventoryFileIdentity {
+    fn key(&self) -> String {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Mac {
+                device,
+                inode,
+                birth_time,
+                birth_time_nanoseconds,
+            } => format!("macos:{device:x}:{inode:x}:{birth_time}:{birth_time_nanoseconds}"),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Self::Unix { device, inode, .. } => format!("unix:{device:x}:{inode:x}"),
+            #[cfg(not(unix))]
+            Self::Path(path) => path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
 pub struct Inventory {
     path: PathBuf,
+    file_identity: InventoryFileIdentity,
+    _file: std::fs::File,
     connection: Connection,
 }
 
@@ -300,13 +427,85 @@ impl Inventory {
                 source,
             })?;
         }
+        match fs::symlink_metadata(&path) {
+            Ok(_) => restrict_inventory_permissions(&path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(InventoryError::Io {
+                    operation: format!("inspect inventory file {}", path.display()),
+                    source,
+                });
+            }
+        }
+        let file = prepare_inventory_file(&path)?;
+        restrict_inventory_permissions(&path)?;
         let connection = Connection::open(&path)?;
+        #[cfg(unix)]
+        let opened_file_identity =
+            inventory_file_identity_from_metadata(&file.metadata().map_err(|source| {
+                InventoryError::Io {
+                    operation: format!("inspect inventory file {}", path.display()),
+                    source,
+                }
+            })?);
+        #[cfg(not(unix))]
+        let opened_file_identity = inventory_file_identity(&path)?;
+        if inventory_file_identity(&path)? != opened_file_identity {
+            return Err(InventoryError::InvalidData(
+                "inventory database changed while it was opening".to_owned(),
+            ));
+        }
         connection.execute_batch(SCHEMA_SQL)?;
-        Ok(Self { path, connection })
+        apply_migrations(&connection)?;
+        #[cfg(unix)]
+        let file_identity =
+            inventory_file_identity_from_metadata(&file.metadata().map_err(|source| {
+                InventoryError::Io {
+                    operation: format!("inspect inventory file {}", path.display()),
+                    source,
+                }
+            })?);
+        #[cfg(not(unix))]
+        let file_identity = inventory_file_identity(&path)?;
+        if inventory_file_identity(&path)? != file_identity {
+            return Err(InventoryError::InvalidData(
+                "inventory database changed while it was opening".to_owned(),
+            ));
+        }
+        Ok(Self {
+            path,
+            file_identity,
+            _file: file,
+            connection,
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn identity_key(&self) -> String {
+        self.file_identity.key()
+    }
+
+    pub(crate) fn ensure_path_identity(&self) -> Result<(), InventoryError> {
+        #[cfg(unix)]
+        let opened_file_identity =
+            inventory_file_identity_from_metadata(&self._file.metadata().map_err(|source| {
+                InventoryError::Io {
+                    operation: format!("inspect inventory file {}", self.path.display()),
+                    source,
+                }
+            })?);
+        #[cfg(not(unix))]
+        let opened_file_identity = self.file_identity.clone();
+        let current = inventory_file_identity(&self.path)?;
+        if current != opened_file_identity {
+            return Err(InventoryError::InvalidData(
+                "inventory database was replaced while it was open".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn register_repository(
@@ -417,6 +616,7 @@ impl Inventory {
             if listed_worktree.is_some_and(|worktree| worktree.prunable || !worktree.path.is_dir())
             {
                 self.release_reservations_for_worktree(id, now)?;
+                self.mark_sessions_stale_for_worktree(id, now)?;
             } else if listed_worktree.is_none()
                 && lifecycle_state != "removed"
                 && lifecycle_state != "archived"
@@ -444,9 +644,31 @@ impl Inventory {
                 statement.bind_i64(2, id)?;
                 statement.expect_done()?;
                 self.release_reservations_for_worktree(id, now)?;
+                self.mark_sessions_stale_for_worktree(id, now)?;
             }
         }
         Ok(())
+    }
+
+    fn mark_sessions_stale_for_worktree(
+        &self,
+        worktree_id: i64,
+        now: i64,
+    ) -> Result<(), InventoryError> {
+        let mut leases = self.connection.prepare(
+            "UPDATE leases SET state = 'expired', renewed_at = ? \
+             WHERE worktree_id = ? AND state = 'active'",
+        )?;
+        leases.bind_i64(1, now)?;
+        leases.bind_i64(2, worktree_id)?;
+        leases.expect_done()?;
+        let mut sessions = self.connection.prepare(
+            "UPDATE sessions SET state = 'stale', last_seen_at = ? \
+             WHERE worktree_id = ? AND state = 'active'",
+        )?;
+        sessions.bind_i64(1, now)?;
+        sessions.bind_i64(2, worktree_id)?;
+        sessions.expect_done()
     }
 
     pub fn repository_by_common_git_dir(
@@ -546,6 +768,808 @@ impl Inventory {
         statement.bind_i64(1, worktree_id)?;
         statement.bind_i64(2, now)?;
         statement.step()
+    }
+
+    pub fn begin_request(
+        &self,
+        id: &str,
+        operation: &str,
+        now: i64,
+    ) -> Result<RequestRecord, InventoryError> {
+        self.ensure_path_identity()?;
+        if id.is_empty() || operation.is_empty() {
+            return Err(InventoryError::InvalidData(
+                "request id and operation cannot be empty".to_owned(),
+            ));
+        }
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.begin_request_inner(id, operation, now);
+        match result {
+            Ok(record) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(record),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn begin_request_inner(
+        &self,
+        id: &str,
+        operation: &str,
+        now: i64,
+    ) -> Result<RequestRecord, InventoryError> {
+        if let Some(existing) = self.request_by_id(id)? {
+            if existing.operation != operation {
+                return Err(InventoryError::Conflict(format!(
+                    "request id {id:?} was already used for operation {:?}",
+                    existing.operation
+                )));
+            }
+            if existing.state == "succeeded" {
+                return Ok(existing);
+            }
+            let mut statement = self.connection.prepare(
+                "UPDATE requests SET state = 'started', response_json = NULL, updated_at = ? \
+                 WHERE id = ?",
+            )?;
+            statement.bind_i64(1, now)?;
+            statement.bind_text(2, id)?;
+            statement.expect_done()?;
+            return self.request_by_id(id)?.ok_or_else(|| {
+                InventoryError::InvalidData("request restart did not return a row".to_owned())
+            });
+        }
+
+        let mut statement = self.connection.prepare(
+            "INSERT INTO requests(id, operation, state, created_at, updated_at) \
+             VALUES (?, ?, 'started', ?, ?)",
+        )?;
+        statement.bind_text(1, id)?;
+        statement.bind_text(2, operation)?;
+        statement.bind_i64(3, now)?;
+        statement.bind_i64(4, now)?;
+        statement.expect_done()?;
+        self.request_by_id(id)?.ok_or_else(|| {
+            InventoryError::InvalidData("request insert did not return a row".to_owned())
+        })
+    }
+
+    pub fn complete_request(
+        &self,
+        id: &str,
+        response_json: &str,
+        now: i64,
+    ) -> Result<RequestRecord, InventoryError> {
+        self.ensure_path_identity()?;
+        let mut statement = self.connection.prepare(
+            "UPDATE requests SET state = 'succeeded', response_json = ?, updated_at = ? \
+             WHERE id = ?",
+        )?;
+        statement.bind_text(1, response_json)?;
+        statement.bind_i64(2, now)?;
+        statement.bind_text(3, id)?;
+        statement.expect_done()?;
+        self.request_by_id(id)?.ok_or_else(|| {
+            InventoryError::InvalidData("completed request did not return a row".to_owned())
+        })
+    }
+
+    pub fn fail_request(&self, id: &str, now: i64) -> Result<(), InventoryError> {
+        self.ensure_path_identity()?;
+        let mut statement = self.connection.prepare(
+            "UPDATE requests SET state = 'failed', response_json = NULL, updated_at = ? \
+             WHERE id = ?",
+        )?;
+        statement.bind_i64(1, now)?;
+        statement.bind_text(2, id)?;
+        statement.expect_done()
+    }
+
+    pub fn request_by_id(&self, id: &str) -> Result<Option<RequestRecord>, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, operation, state, response_json, created_at, updated_at \
+             FROM requests WHERE id = ?",
+        )?;
+        statement.bind_text(1, id)?;
+        if !statement.step()? {
+            return Ok(None);
+        }
+        Ok(Some(request_from_statement(&statement)?))
+    }
+
+    pub fn register_session(
+        &self,
+        input: SessionInput<'_>,
+    ) -> Result<SessionRecord, InventoryError> {
+        if input.id.is_empty() || input.provider.is_empty() {
+            return Err(InventoryError::InvalidData(
+                "session id and provider cannot be empty".to_owned(),
+            ));
+        }
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.register_session_inner(input);
+        match result {
+            Ok(session) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(session),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn register_session_with_lease_and_event(
+        &self,
+        input: SessionInput<'_>,
+        lease_ttl_seconds: Option<i64>,
+        event: EventInput<'_>,
+    ) -> Result<SessionLeaseResult, InventoryError> {
+        self.register_session_with_lease_and_event_builder(
+            input,
+            lease_ttl_seconds,
+            EventMetadata {
+                repository_id: event.repository_id,
+                worktree_id: event.worktree_id,
+                occurred_at: event.occurred_at,
+                actor: event.actor,
+                action: event.action,
+                result: event.result,
+            },
+            |_, _| event.details_json.to_owned(),
+        )
+    }
+
+    pub fn register_session_with_lease_and_event_builder<F>(
+        &self,
+        input: SessionInput<'_>,
+        lease_ttl_seconds: Option<i64>,
+        event: EventMetadata<'_>,
+        details: F,
+    ) -> Result<SessionLeaseResult, InventoryError>
+    where
+        F: FnOnce(&SessionRecord, Option<&LeaseRecord>) -> String,
+    {
+        if input.id.is_empty() || input.provider.is_empty() {
+            return Err(InventoryError::InvalidData(
+                "session id and provider cannot be empty".to_owned(),
+            ));
+        }
+        if lease_ttl_seconds.is_some_and(|ttl| ttl <= 0) {
+            return Err(InventoryError::InvalidData(
+                "lease TTL must be positive".to_owned(),
+            ));
+        }
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let session = self.register_session_inner(input)?;
+            let lease = match lease_ttl_seconds {
+                Some(ttl_seconds) => Some(self.acquire_lease_inner(
+                    input.worktree_id,
+                    input.id,
+                    ttl_seconds,
+                    input.now,
+                )?),
+                None => None,
+            };
+            let details_json = details(&session, lease.as_ref());
+            self.record_event_inner(EventInput {
+                repository_id: event.repository_id,
+                worktree_id: event.worktree_id,
+                occurred_at: event.occurred_at,
+                actor: event.actor,
+                action: event.action,
+                result: event.result,
+                details_json: &details_json,
+            })?;
+            Ok(SessionLeaseResult { session, lease })
+        })();
+        match result {
+            Ok(result) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(result),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn register_session_inner(
+        &self,
+        input: SessionInput<'_>,
+    ) -> Result<SessionRecord, InventoryError> {
+        if let Some(existing) = self.session_by_id(input.id)? {
+            if existing.worktree_id != input.worktree_id || existing.provider != input.provider {
+                return Err(InventoryError::Conflict(format!(
+                    "session {:?} is already registered to another worktree or provider",
+                    input.id
+                )));
+            }
+            let mut statement = self.connection.prepare(
+                "UPDATE sessions SET provider_session_id = ?, pid = ?, \
+                    process_started_at = ?, terminal_metadata = ?, state = 'active', \
+                    last_seen_at = ? WHERE id = ?",
+            )?;
+            statement.bind_optional_text(1, input.provider_session_id)?;
+            statement.bind_i64_option(2, input.pid)?;
+            statement.bind_i64_option(3, input.process_started_at)?;
+            statement.bind_optional_text(4, input.terminal_metadata)?;
+            statement.bind_i64(5, input.now)?;
+            statement.bind_text(6, input.id)?;
+            statement.expect_done()?;
+        } else {
+            let mut statement = self.connection.prepare(
+                "INSERT INTO sessions( \
+                    id, worktree_id, provider, provider_session_id, pid, process_started_at, \
+                    terminal_metadata, state, created_at, last_seen_at \
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+            )?;
+            statement.bind_text(1, input.id)?;
+            statement.bind_i64(2, input.worktree_id)?;
+            statement.bind_text(3, input.provider)?;
+            statement.bind_optional_text(4, input.provider_session_id)?;
+            statement.bind_i64_option(5, input.pid)?;
+            statement.bind_i64_option(6, input.process_started_at)?;
+            statement.bind_optional_text(7, input.terminal_metadata)?;
+            statement.bind_i64(8, input.now)?;
+            statement.bind_i64(9, input.now)?;
+            statement.expect_done()?;
+        }
+        self.session_by_id(input.id)?.ok_or_else(|| {
+            InventoryError::InvalidData("session upsert did not return a row".to_owned())
+        })
+    }
+
+    pub fn session_by_id(&self, id: &str) -> Result<Option<SessionRecord>, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, worktree_id, provider, provider_session_id, pid, process_started_at, \
+                    terminal_metadata, state, created_at, last_seen_at \
+             FROM sessions WHERE id = ?",
+        )?;
+        statement.bind_text(1, id)?;
+        if !statement.step()? {
+            return Ok(None);
+        }
+        Ok(Some(session_from_statement(&statement)?))
+    }
+
+    pub fn touch_session(
+        &self,
+        session_id: &str,
+        now: i64,
+    ) -> Result<Option<SessionRecord>, InventoryError> {
+        let mut statement = self
+            .connection
+            .prepare("UPDATE sessions SET last_seen_at = ? WHERE id = ? AND state = 'active'")?;
+        statement.bind_i64(1, now)?;
+        statement.bind_text(2, session_id)?;
+        statement.expect_done()?;
+        self.session_by_id(session_id)
+    }
+
+    pub fn heartbeat_session_with_lease_and_event(
+        &self,
+        session_id: &str,
+        lease_ttl_seconds: Option<i64>,
+        now: i64,
+        event: EventInput<'_>,
+    ) -> Result<SessionLeaseResult, InventoryError> {
+        self.heartbeat_session_with_lease_and_event_builder(
+            session_id,
+            lease_ttl_seconds,
+            now,
+            EventMetadata {
+                repository_id: event.repository_id,
+                worktree_id: event.worktree_id,
+                occurred_at: event.occurred_at,
+                actor: event.actor,
+                action: event.action,
+                result: event.result,
+            },
+            |_, _| event.details_json.to_owned(),
+        )
+    }
+
+    pub fn heartbeat_session_with_lease_and_event_builder<F>(
+        &self,
+        session_id: &str,
+        lease_ttl_seconds: Option<i64>,
+        now: i64,
+        event: EventMetadata<'_>,
+        details: F,
+    ) -> Result<SessionLeaseResult, InventoryError>
+    where
+        F: FnOnce(&SessionRecord, Option<&LeaseRecord>) -> String,
+    {
+        if lease_ttl_seconds.is_some_and(|ttl| ttl <= 0) {
+            return Err(InventoryError::InvalidData(
+                "lease TTL must be positive".to_owned(),
+            ));
+        }
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.expire_leases_inner(now)?;
+            let session = self.session_by_id(session_id)?.ok_or_else(|| {
+                InventoryError::Conflict(format!("session {session_id:?} is not registered"))
+            })?;
+            if session.state != "active" {
+                return Err(InventoryError::Conflict(format!(
+                    "session {session_id:?} is not active (state {:?})",
+                    session.state
+                )));
+            }
+            let mut touch = self.connection.prepare(
+                "UPDATE sessions SET last_seen_at = ? WHERE id = ? AND state = 'active'",
+            )?;
+            touch.bind_i64(1, now)?;
+            touch.bind_text(2, session_id)?;
+            touch.expect_done()?;
+            let session = self.session_by_id(session_id)?.ok_or_else(|| {
+                InventoryError::InvalidData("heartbeat session disappeared".to_owned())
+            })?;
+            let lease = match lease_ttl_seconds {
+                Some(ttl_seconds) => match self.renew_lease_inner(session_id, ttl_seconds, now)? {
+                    Some(lease) => Some(lease),
+                    None => Some(self.acquire_lease_inner(
+                        session.worktree_id,
+                        session_id,
+                        ttl_seconds,
+                        now,
+                    )?),
+                },
+                None => self.active_lease_for_session(session_id, now)?,
+            };
+            let details_json = details(&session, lease.as_ref());
+            self.record_event_inner(EventInput {
+                repository_id: event.repository_id,
+                worktree_id: event.worktree_id,
+                occurred_at: event.occurred_at,
+                actor: event.actor,
+                action: event.action,
+                result: event.result,
+                details_json: &details_json,
+            })?;
+            Ok(SessionLeaseResult { session, lease })
+        })();
+        match result {
+            Ok(result) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(result),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn release_session(
+        &self,
+        session_id: &str,
+        now: i64,
+    ) -> Result<Option<SessionRecord>, InventoryError> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.release_session_inner(session_id, now);
+        match result {
+            Ok(session) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(session),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn release_session_with_event(
+        &self,
+        session_id: &str,
+        now: i64,
+        event: EventInput<'_>,
+    ) -> Result<Option<SessionRecord>, InventoryError> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let session = self.release_session_inner(session_id, now)?;
+            if session.is_some() {
+                self.record_event_inner(event)?;
+            }
+            Ok(session)
+        })();
+        match result {
+            Ok(session) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(session),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn release_session_inner(
+        &self,
+        session_id: &str,
+        now: i64,
+    ) -> Result<Option<SessionRecord>, InventoryError> {
+        let mut leases = self.connection.prepare(
+            "UPDATE leases SET state = 'released', renewed_at = ? \
+             WHERE session_id = ? AND state = 'active'",
+        )?;
+        leases.bind_i64(1, now)?;
+        leases.bind_text(2, session_id)?;
+        leases.expect_done()?;
+        let mut session = self
+            .connection
+            .prepare("UPDATE sessions SET state = 'released', last_seen_at = ? WHERE id = ?")?;
+        session.bind_i64(1, now)?;
+        session.bind_text(2, session_id)?;
+        session.expect_done()?;
+        self.session_by_id(session_id)
+    }
+
+    pub fn acquire_lease(
+        &self,
+        worktree_id: i64,
+        session_id: &str,
+        ttl_seconds: i64,
+        now: i64,
+    ) -> Result<LeaseRecord, InventoryError> {
+        if ttl_seconds <= 0 {
+            return Err(InventoryError::InvalidData(
+                "lease TTL must be positive".to_owned(),
+            ));
+        }
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.acquire_lease_inner(worktree_id, session_id, ttl_seconds, now);
+        match result {
+            Ok(lease) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(lease),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn acquire_lease_with_event(
+        &self,
+        worktree_id: i64,
+        session_id: &str,
+        ttl_seconds: i64,
+        now: i64,
+        event: EventInput<'_>,
+    ) -> Result<LeaseRecord, InventoryError> {
+        self.acquire_lease_with_event_builder(
+            worktree_id,
+            session_id,
+            ttl_seconds,
+            now,
+            EventMetadata {
+                repository_id: event.repository_id,
+                worktree_id: event.worktree_id,
+                occurred_at: event.occurred_at,
+                actor: event.actor,
+                action: event.action,
+                result: event.result,
+            },
+            |_| event.details_json.to_owned(),
+        )
+    }
+
+    pub fn acquire_lease_with_event_builder<F>(
+        &self,
+        worktree_id: i64,
+        session_id: &str,
+        ttl_seconds: i64,
+        now: i64,
+        event: EventMetadata<'_>,
+        details: F,
+    ) -> Result<LeaseRecord, InventoryError>
+    where
+        F: FnOnce(&LeaseRecord) -> String,
+    {
+        if ttl_seconds <= 0 {
+            return Err(InventoryError::InvalidData(
+                "lease TTL must be positive".to_owned(),
+            ));
+        }
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let lease = self.acquire_lease_inner(worktree_id, session_id, ttl_seconds, now)?;
+            let details_json = details(&lease);
+            self.record_event_inner(EventInput {
+                repository_id: event.repository_id,
+                worktree_id: event.worktree_id,
+                occurred_at: event.occurred_at,
+                actor: event.actor,
+                action: event.action,
+                result: event.result,
+                details_json: &details_json,
+            })?;
+            Ok(lease)
+        })();
+        match result {
+            Ok(lease) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(lease),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn acquire_lease_inner(
+        &self,
+        worktree_id: i64,
+        session_id: &str,
+        ttl_seconds: i64,
+        now: i64,
+    ) -> Result<LeaseRecord, InventoryError> {
+        let session = self.session_by_id(session_id)?.ok_or_else(|| {
+            InventoryError::Conflict(format!("session {session_id:?} is not registered"))
+        })?;
+        if session.state != "active" {
+            return Err(InventoryError::Conflict(format!(
+                "session {session_id:?} is not active (state {:?})",
+                session.state
+            )));
+        }
+        if session.worktree_id != worktree_id {
+            return Err(InventoryError::Conflict(format!(
+                "session {session_id:?} belongs to worktree {}, not {worktree_id}",
+                session.worktree_id
+            )));
+        }
+        let mut expire = self.connection.prepare(
+            "UPDATE leases SET state = 'expired', renewed_at = ? \
+             WHERE worktree_id = ? AND state = 'active' AND expires_at <= ?",
+        )?;
+        expire.bind_i64(1, now)?;
+        expire.bind_i64(2, worktree_id)?;
+        expire.bind_i64(3, now)?;
+        expire.expect_done()?;
+
+        if let Some(existing) = self.active_lease_for_worktree(worktree_id)? {
+            if existing.session_id != session_id {
+                return Err(InventoryError::Conflict(format!(
+                    "worktree {worktree_id} is leased by session {:?}",
+                    existing.session_id
+                )));
+            }
+            let expires_at = now.saturating_add(ttl_seconds);
+            let mut statement = self.connection.prepare(
+                "UPDATE leases SET renewed_at = ?, expires_at = ?, state = 'active' \
+                 WHERE id = ?",
+            )?;
+            statement.bind_i64(1, now)?;
+            statement.bind_i64(2, expires_at)?;
+            statement.bind_i64(3, existing.id)?;
+            statement.expect_done()?;
+            return self.lease_by_id(existing.id)?.ok_or_else(|| {
+                InventoryError::InvalidData("renewed lease did not return a row".to_owned())
+            });
+        }
+
+        let mut statement = self.connection.prepare(
+            "INSERT INTO leases( \
+                worktree_id, session_id, acquired_at, renewed_at, expires_at, state \
+             ) VALUES (?, ?, ?, ?, ?, 'active')",
+        )?;
+        statement.bind_i64(1, worktree_id)?;
+        statement.bind_text(2, session_id)?;
+        statement.bind_i64(3, now)?;
+        statement.bind_i64(4, now)?;
+        statement.bind_i64(5, now.saturating_add(ttl_seconds))?;
+        statement.expect_done()?;
+        let id = self.connection.last_insert_rowid();
+        self.lease_by_id(id)?.ok_or_else(|| {
+            InventoryError::InvalidData("lease insert did not return a row".to_owned())
+        })
+    }
+
+    pub fn renew_lease(
+        &self,
+        session_id: &str,
+        ttl_seconds: i64,
+        now: i64,
+    ) -> Result<Option<LeaseRecord>, InventoryError> {
+        if ttl_seconds <= 0 {
+            return Err(InventoryError::InvalidData(
+                "lease TTL must be positive".to_owned(),
+            ));
+        }
+        self.renew_lease_inner(session_id, ttl_seconds, now)
+    }
+
+    fn renew_lease_inner(
+        &self,
+        session_id: &str,
+        ttl_seconds: i64,
+        now: i64,
+    ) -> Result<Option<LeaseRecord>, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "UPDATE leases SET renewed_at = ?, expires_at = ? \
+             WHERE session_id = ? AND state = 'active' AND expires_at > ?",
+        )?;
+        statement.bind_i64(1, now)?;
+        statement.bind_i64(2, now.saturating_add(ttl_seconds))?;
+        statement.bind_text(3, session_id)?;
+        statement.bind_i64(4, now)?;
+        statement.expect_done()?;
+        self.active_lease_for_session(session_id, now)
+    }
+
+    pub fn release_lease(
+        &self,
+        session_id: &str,
+        now: i64,
+    ) -> Result<Vec<LeaseRecord>, InventoryError> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.release_lease_inner(session_id, now);
+        match result {
+            Ok(leases) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(leases),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn release_lease_with_event(
+        &self,
+        session_id: &str,
+        now: i64,
+        event: EventInput<'_>,
+    ) -> Result<Vec<LeaseRecord>, InventoryError> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let leases = self.release_lease_inner(session_id, now)?;
+            self.record_event_inner(event)?;
+            Ok(leases)
+        })();
+        match result {
+            Ok(leases) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(leases),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn release_lease_inner(
+        &self,
+        session_id: &str,
+        now: i64,
+    ) -> Result<Vec<LeaseRecord>, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "UPDATE leases SET state = 'released', renewed_at = ? \
+             WHERE session_id = ? AND state = 'active'",
+        )?;
+        statement.bind_i64(1, now)?;
+        statement.bind_text(2, session_id)?;
+        statement.expect_done()?;
+        self.leases_for_session(session_id)
+    }
+
+    pub fn expire_leases(&self, now: i64) -> Result<u64, InventoryError> {
+        self.expire_leases_inner(now)
+    }
+
+    fn expire_leases_inner(&self, now: i64) -> Result<u64, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "UPDATE leases SET state = 'expired', renewed_at = ? \
+             WHERE state = 'active' AND expires_at <= ?",
+        )?;
+        statement.bind_i64(1, now)?;
+        statement.bind_i64(2, now)?;
+        statement.expect_done()?;
+        Ok(self.connection.changes())
+    }
+
+    pub fn active_lease_for_worktree(
+        &self,
+        worktree_id: i64,
+    ) -> Result<Option<LeaseRecord>, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, worktree_id, session_id, acquired_at, renewed_at, expires_at, state \
+             FROM leases WHERE worktree_id = ? AND state = 'active' LIMIT 1",
+        )?;
+        statement.bind_i64(1, worktree_id)?;
+        if !statement.step()? {
+            return Ok(None);
+        }
+        Ok(Some(lease_from_statement(&statement)?))
+    }
+
+    pub fn active_lease_for_session(
+        &self,
+        session_id: &str,
+        now: i64,
+    ) -> Result<Option<LeaseRecord>, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, worktree_id, session_id, acquired_at, renewed_at, expires_at, state \
+             FROM leases WHERE session_id = ? AND state = 'active' AND expires_at > ? LIMIT 1",
+        )?;
+        statement.bind_text(1, session_id)?;
+        statement.bind_i64(2, now)?;
+        if !statement.step()? {
+            return Ok(None);
+        }
+        Ok(Some(lease_from_statement(&statement)?))
+    }
+
+    pub fn leases_for_session(&self, session_id: &str) -> Result<Vec<LeaseRecord>, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, worktree_id, session_id, acquired_at, renewed_at, expires_at, state \
+             FROM leases WHERE session_id = ? ORDER BY id",
+        )?;
+        statement.bind_text(1, session_id)?;
+        let mut records = Vec::new();
+        while statement.step()? {
+            records.push(lease_from_statement(&statement)?);
+        }
+        Ok(records)
+    }
+
+    pub fn lease_by_id(&self, id: i64) -> Result<Option<LeaseRecord>, InventoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, worktree_id, session_id, acquired_at, renewed_at, expires_at, state \
+             FROM leases WHERE id = ?",
+        )?;
+        statement.bind_i64(1, id)?;
+        if !statement.step()? {
+            return Ok(None);
+        }
+        Ok(Some(lease_from_statement(&statement)?))
     }
 
     pub fn reserve_creation(
@@ -649,6 +1673,10 @@ impl Inventory {
     }
 
     pub fn record_event(&self, input: EventInput<'_>) -> Result<EventRecord, InventoryError> {
+        self.record_event_inner(input)
+    }
+
+    fn record_event_inner(&self, input: EventInput<'_>) -> Result<EventRecord, InventoryError> {
         let mut statement = self.connection.prepare(
             "INSERT INTO events( \
                 repository_id, worktree_id, occurred_at, actor, action, result, details_json \
@@ -776,6 +1804,114 @@ impl fmt::Debug for Inventory {
     }
 }
 
+fn apply_migrations(connection: &Connection) -> Result<(), InventoryError> {
+    let current_version = {
+        let mut statement =
+            connection.prepare("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")?;
+        if statement.step()? {
+            statement.column_i64(0)
+        } else {
+            0
+        }
+    };
+    if current_version >= 2 {
+        return Ok(());
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    match connection.execute_batch(MIGRATION_2_SQL) {
+        Ok(()) => match connection.execute_batch("COMMIT") {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        },
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn prepare_inventory_file(path: &Path) -> Result<std::fs::File, InventoryError> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(|source| InventoryError::Io {
+        operation: format!("prepare inventory file {}", path.display()),
+        source,
+    })
+}
+
+fn inventory_file_identity(path: &Path) -> Result<InventoryFileIdentity, InventoryError> {
+    #[cfg(unix)]
+    {
+        let metadata = fs::metadata(path).map_err(|source| InventoryError::Io {
+            operation: format!("inspect inventory identity {}", path.display()),
+            source,
+        })?;
+        Ok(inventory_file_identity_from_metadata(&metadata))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(InventoryFileIdentity::Path(
+            fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn inventory_file_identity_from_metadata(metadata: &fs::Metadata) -> InventoryFileIdentity {
+    use std::os::macos::fs::MetadataExt as MacMetadataExt;
+    use std::os::unix::fs::MetadataExt as UnixMetadataExt;
+    InventoryFileIdentity::Mac {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        birth_time: metadata.st_birthtime(),
+        birth_time_nanoseconds: metadata.st_birthtime_nsec(),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn inventory_file_identity_from_metadata(metadata: &fs::Metadata) -> InventoryFileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    InventoryFileIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        change_time: metadata.ctime(),
+        change_time_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+fn restrict_inventory_permissions(path: &Path) -> Result<(), InventoryError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)
+            .map_err(|source| InventoryError::Io {
+                operation: format!("inspect inventory permissions {}", path.display()),
+                source,
+            })?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions).map_err(|source| InventoryError::Io {
+            operation: format!("restrict inventory permissions {}", path.display()),
+            source,
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 struct Connection {
     raw: *mut Sqlite3,
 }
@@ -875,6 +2011,10 @@ impl Connection {
 
     fn last_insert_rowid(&self) -> i64 {
         unsafe { sqlite3_last_insert_rowid(self.raw) }
+    }
+
+    fn changes(&self) -> u64 {
+        unsafe { sqlite3_changes(self.raw) as u64 }
     }
 }
 
@@ -1016,6 +2156,7 @@ impl Drop for Statement<'_> {
 
 unsafe extern "C" {
     fn sqlite3_last_insert_rowid(database: *mut Sqlite3) -> i64;
+    fn sqlite3_changes(database: *mut Sqlite3) -> c_int;
 }
 
 fn path_bytes(path: &Path) -> Vec<u8> {
@@ -1105,6 +2246,44 @@ fn event_from_statement(statement: &Statement<'_>) -> Result<EventRecord, Invent
     })
 }
 
+fn request_from_statement(statement: &Statement<'_>) -> Result<RequestRecord, InventoryError> {
+    Ok(RequestRecord {
+        id: statement.column_text_required(0)?,
+        operation: statement.column_text_required(1)?,
+        state: statement.column_text_required(2)?,
+        response_json: statement.column_text(3)?,
+        created_at: statement.column_i64(4),
+        updated_at: statement.column_i64(5),
+    })
+}
+
+fn session_from_statement(statement: &Statement<'_>) -> Result<SessionRecord, InventoryError> {
+    Ok(SessionRecord {
+        id: statement.column_text_required(0)?,
+        worktree_id: statement.column_i64(1),
+        provider: statement.column_text_required(2)?,
+        provider_session_id: statement.column_text(3)?,
+        pid: statement.column_text_i64(4)?,
+        process_started_at: statement.column_text_i64(5)?,
+        terminal_metadata: statement.column_text(6)?,
+        state: statement.column_text_required(7)?,
+        created_at: statement.column_i64(8),
+        last_seen_at: statement.column_i64(9),
+    })
+}
+
+fn lease_from_statement(statement: &Statement<'_>) -> Result<LeaseRecord, InventoryError> {
+    Ok(LeaseRecord {
+        id: statement.column_i64(0),
+        worktree_id: statement.column_i64(1),
+        session_id: statement.column_text_required(2)?,
+        acquired_at: statement.column_i64(3),
+        renewed_at: statement.column_i64(4),
+        expires_at: statement.column_i64(5),
+        state: statement.column_text_required(6)?,
+    })
+}
+
 impl Statement<'_> {
     fn column_text_i64(&self, column: c_int) -> Result<Option<i64>, InventoryError> {
         let column_type = unsafe { sqlite3_column_type(self.raw, column) };
@@ -1120,7 +2299,7 @@ impl Statement<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::Inventory;
+    use super::{Connection, Inventory, SCHEMA_SQL, SessionInput, apply_migrations};
     use crate::git::GitRepository;
     use std::fs;
     use std::path::PathBuf;
@@ -1167,6 +2346,110 @@ mod tests {
             })
             .expect("event recorded");
         assert_eq!(inventory.events(repository_record.id).unwrap(), vec![event]);
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn migrates_duplicate_active_leases_before_creating_the_unique_index() {
+        let directory = temporary_directory();
+        let database = directory.join("inventory.sqlite3");
+        {
+            let connection = Connection::open(&database).expect("SQLite connection opened");
+            connection
+                .execute_batch(SCHEMA_SQL)
+                .expect("base schema created");
+            connection
+                .execute_batch(
+                    "INSERT INTO repositories(id, common_git_dir, root_path, display_name, added_at, last_seen_at) \
+                     VALUES (1, '/repo/.git', '/repo', 'repo', 1, 1); \
+                     INSERT INTO worktrees(id, repository_id, path, git_state, lifecycle_state, first_seen_at, last_seen_at) \
+                     VALUES (1, 1, '/repo', 'available', 'active', 1, 1); \
+                     INSERT INTO sessions(id, worktree_id, provider, state, created_at, last_seen_at) \
+                     VALUES ('session-1', 1, 'test', 'active', 1, 1); \
+                     INSERT INTO leases(worktree_id, session_id, acquired_at, renewed_at, expires_at, state) \
+                     VALUES (1, 'session-1', 1, 1, 100, 'active'), \
+                            (1, 'session-1', 2, 2, 200, 'active');",
+                )
+                .expect("legacy duplicate leases inserted");
+            apply_migrations(&connection).expect("schema migration applied");
+            let mut statement = connection
+                .prepare("SELECT COUNT(*) FROM leases WHERE state = 'active'")
+                .expect("lease count prepared");
+            assert!(statement.step().expect("lease count queried"));
+            assert_eq!(statement.column_i64(0), 1);
+        }
+        Inventory::open(&database).expect("migrated inventory reopened");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn request_journal_and_leases_recover_after_interruption() {
+        let directory = temporary_directory();
+        let repository_path = directory.join("repository");
+        fs::create_dir(&repository_path).expect("repository directory should be created");
+        run_git(&repository_path, &["init", "-q", "-b", "main"]);
+        run_git(&repository_path, &["config", "user.name", "Inventory Test"]);
+        run_git(
+            &repository_path,
+            &["config", "user.email", "inventory@example.test"],
+        );
+        fs::write(repository_path.join("README.md"), "inventory\n")
+            .expect("fixture file should be written");
+        run_git(&repository_path, &["add", "README.md"]);
+        run_git(&repository_path, &["commit", "-q", "-m", "initial"]);
+
+        let repository = GitRepository::discover(&repository_path).expect("repository discovered");
+        let worktrees = repository.list_worktrees().expect("worktrees listed");
+        let inventory =
+            Inventory::open(directory.join("inventory.sqlite3")).expect("inventory opened");
+        let repository_record = inventory
+            .register_repository(&repository, 100)
+            .expect("repository registered");
+        let records = inventory
+            .reconcile_repository(&repository, &worktrees, 100)
+            .expect("repository reconciled");
+        let worktree = &records[0];
+        inventory
+            .register_session(SessionInput {
+                id: "session-1",
+                worktree_id: worktree.id,
+                provider: "test",
+                provider_session_id: Some("provider-1"),
+                pid: None,
+                process_started_at: None,
+                terminal_metadata: None,
+                now: 100,
+            })
+            .expect("session registered");
+        let lease = inventory
+            .acquire_lease(worktree.id, "session-1", 10, 100)
+            .expect("lease acquired");
+        assert!(inventory.active_lease_exists(worktree.id, 109).unwrap());
+        assert!(!inventory.active_lease_exists(worktree.id, 110).unwrap());
+        assert_eq!(inventory.expire_leases(110).unwrap(), 1);
+        assert_eq!(
+            inventory.lease_by_id(lease.id).unwrap().unwrap().state,
+            "expired"
+        );
+
+        let started = inventory
+            .begin_request("request-1", "create:abc", 100)
+            .expect("request started");
+        assert_eq!(started.state, "started");
+        let restarted = inventory
+            .begin_request("request-1", "create:abc", 101)
+            .expect("request restarted");
+        assert_eq!(restarted.state, "started");
+        inventory
+            .complete_request("request-1", "{\"ok\":true}", 102)
+            .expect("request completed");
+        let replay = inventory
+            .begin_request("request-1", "create:abc", 103)
+            .expect("request replayed");
+        assert_eq!(replay.state, "succeeded");
+        assert_eq!(replay.response_json.as_deref(), Some("{\"ok\":true}"));
+        assert_eq!(repository_record.id, worktree.repository_id);
 
         let _ = fs::remove_dir_all(directory);
     }

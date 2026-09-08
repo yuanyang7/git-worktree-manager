@@ -1,5 +1,8 @@
 use crate::git::{GitError, GitRepository, GitWorktree, GitWorktreeStatus};
-use crate::inventory::{EventInput, Inventory, InventoryError, RepositoryRecord, WorktreeRecord};
+use crate::inventory::{
+    EventInput, EventMetadata, Inventory, InventoryError, LeaseRecord, RepositoryRecord,
+    SessionInput, SessionRecord, WorktreeRecord,
+};
 use crate::json;
 use crate::process::active_processes;
 use std::collections::HashMap;
@@ -174,6 +177,54 @@ pub struct RemoveResult {
     pub branch_deleted: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegisterSessionRequest {
+    pub session_id: String,
+    pub worktree: PathBuf,
+    pub provider: String,
+    pub provider_session_id: Option<String>,
+    pub pid: Option<i64>,
+    pub process_started_at: Option<i64>,
+    pub terminal_metadata: Option<String>,
+    pub lease_ttl_seconds: Option<i64>,
+    pub actor: String,
+}
+
+impl RegisterSessionRequest {
+    pub fn new(session_id: impl Into<String>, worktree: impl Into<PathBuf>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            worktree: worktree.into(),
+            provider: "terminal".to_owned(),
+            provider_session_id: None,
+            pid: None,
+            process_started_at: None,
+            terminal_metadata: None,
+            lease_ttl_seconds: None,
+            actor: "daemon".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResult {
+    pub session: SessionRecord,
+    pub lease: Option<LeaseRecord>,
+    pub already_registered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatResult {
+    pub session: SessionRecord,
+    pub lease: Option<LeaseRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseResult {
+    pub lease: LeaseRecord,
+    pub already_active: bool,
+}
+
 impl RemoveResult {
     pub fn to_json(&self) -> String {
         json::Object::new()
@@ -272,10 +323,261 @@ impl RepositoryService {
         &self.inventory
     }
 
+    pub fn minimum_cleanup_age_seconds(&self) -> i64 {
+        self.minimum_cleanup_age_seconds
+    }
+
     pub fn refresh(&self) -> Result<(RepositoryRecord, Vec<WorktreeRecord>), ServiceError> {
         let _guard = self.mutation_guard()?;
         let worktrees = self.repository.list_worktrees()?;
         self.refresh_from_worktrees(&worktrees)
+    }
+
+    pub fn register_session(
+        &self,
+        request: RegisterSessionRequest,
+    ) -> Result<SessionResult, ServiceError> {
+        let _guard = self.mutation_guard()?;
+        validate_session_request(&request)?;
+        let worktrees = self.repository.list_worktrees()?;
+        let requested = absolute_path(&request.worktree)?;
+        let worktree = find_worktree(&worktrees, &requested)
+            .ok_or_else(|| ServiceError::NotFound(requested.clone()))?;
+        if worktree.bare || worktree.prunable || !worktree.path.is_dir() {
+            return Err(ServiceError::InvalidRequest(
+                "session worktree must be an available directory".to_owned(),
+            ));
+        }
+        let (repository_record, records) = self.refresh_from_worktrees(&worktrees)?;
+        let record = records
+            .iter()
+            .find(|record| record.path == worktree.path.to_string_lossy())
+            .ok_or_else(|| {
+                ServiceError::InvalidRequest(
+                    "session worktree was not persisted in the inventory".to_owned(),
+                )
+            })?;
+        let existing = self.inventory.session_by_id(&request.session_id)?;
+        let registration = self
+            .inventory
+            .register_session_with_lease_and_event_builder(
+                SessionInput {
+                    id: &request.session_id,
+                    worktree_id: record.id,
+                    provider: &request.provider,
+                    provider_session_id: request.provider_session_id.as_deref(),
+                    pid: request.pid,
+                    process_started_at: request.process_started_at,
+                    terminal_metadata: request.terminal_metadata.as_deref(),
+                    now: unix_now(),
+                },
+                request.lease_ttl_seconds,
+                EventMetadata {
+                    repository_id: repository_record.id,
+                    worktree_id: Some(record.id),
+                    occurred_at: unix_now(),
+                    actor: &request.actor,
+                    action: "register_session",
+                    result: if existing.is_some() {
+                        "idempotent-replay"
+                    } else {
+                        "succeeded"
+                    },
+                },
+                |_, lease| session_details(&request, &requested, lease),
+            )?;
+        Ok(SessionResult {
+            session: registration.session,
+            lease: registration.lease,
+            already_registered: existing.is_some(),
+        })
+    }
+
+    pub fn heartbeat_session(
+        &self,
+        session_id: &str,
+        lease_ttl_seconds: Option<i64>,
+        actor: &str,
+    ) -> Result<HeartbeatResult, ServiceError> {
+        let _guard = self.mutation_guard()?;
+        if session_id.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "session id cannot be empty".to_owned(),
+            ));
+        }
+        if lease_ttl_seconds.is_some_and(|ttl| ttl <= 0) {
+            return Err(ServiceError::InvalidRequest(
+                "lease TTL must be positive".to_owned(),
+            ));
+        }
+        let now = unix_now();
+        let session = self.inventory.session_by_id(session_id)?.ok_or_else(|| {
+            ServiceError::InvalidRequest(format!("session {session_id:?} not found"))
+        })?;
+        let heartbeat = self
+            .inventory
+            .heartbeat_session_with_lease_and_event_builder(
+                session_id,
+                lease_ttl_seconds,
+                now,
+                EventMetadata {
+                    repository_id: self.repository_record_id()?,
+                    worktree_id: Some(session.worktree_id),
+                    occurred_at: now,
+                    actor,
+                    action: "heartbeat_session",
+                    result: "succeeded",
+                },
+                |_, lease| {
+                    json::Object::new()
+                        .string("session_id", session_id)
+                        .optional_number(
+                            "lease_id",
+                            lease.and_then(|lease| u64::try_from(lease.id).ok()),
+                        )
+                        .finish()
+                },
+            )?;
+        Ok(HeartbeatResult {
+            session: heartbeat.session,
+            lease: heartbeat.lease,
+        })
+    }
+
+    pub fn acquire_lease(
+        &self,
+        worktree: impl AsRef<Path>,
+        session_id: &str,
+        ttl_seconds: i64,
+        actor: &str,
+    ) -> Result<LeaseResult, ServiceError> {
+        let _guard = self.mutation_guard()?;
+        if ttl_seconds <= 0 {
+            return Err(ServiceError::InvalidRequest(
+                "lease TTL must be positive".to_owned(),
+            ));
+        }
+        let worktrees = self.repository.list_worktrees()?;
+        let requested = absolute_path(worktree.as_ref())?;
+        let git_worktree = find_worktree(&worktrees, &requested)
+            .ok_or_else(|| ServiceError::NotFound(requested.clone()))?;
+        let (repository_record, records) = self.refresh_from_worktrees(&worktrees)?;
+        let record = records
+            .iter()
+            .find(|record| record.path == git_worktree.path.to_string_lossy())
+            .ok_or_else(|| {
+                ServiceError::InvalidRequest(
+                    "lease worktree was not persisted in the inventory".to_owned(),
+                )
+            })?;
+        let _session = self.inventory.session_by_id(session_id)?.ok_or_else(|| {
+            ServiceError::InvalidRequest(format!("session {session_id:?} not found"))
+        })?;
+        let now = unix_now();
+        let existing = self.inventory.active_lease_for_worktree(record.id)?;
+        let lease = self.inventory.acquire_lease_with_event_builder(
+            record.id,
+            session_id,
+            ttl_seconds,
+            now,
+            EventMetadata {
+                repository_id: repository_record.id,
+                worktree_id: Some(record.id),
+                occurred_at: now,
+                actor,
+                action: "acquire_lease",
+                result: "succeeded",
+            },
+            |lease| {
+                json::Object::new()
+                    .string("session_id", session_id)
+                    .number("lease_id", lease.id as u64)
+                    .number("ttl_seconds", ttl_seconds as u64)
+                    .finish()
+            },
+        )?;
+        Ok(LeaseResult {
+            lease,
+            already_active: existing.is_some_and(|existing| {
+                existing.session_id == session_id && existing.expires_at > now
+            }),
+        })
+    }
+
+    pub fn release_lease(
+        &self,
+        session_id: &str,
+        actor: &str,
+    ) -> Result<Vec<LeaseRecord>, ServiceError> {
+        let _guard = self.mutation_guard()?;
+        if session_id.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "session id cannot be empty".to_owned(),
+            ));
+        }
+        let session = self.inventory.session_by_id(session_id)?.ok_or_else(|| {
+            ServiceError::InvalidRequest(format!("session {session_id:?} not found"))
+        })?;
+        let now = unix_now();
+        let leases_before = self.inventory.leases_for_session(session_id)?;
+        let details = json::Object::new()
+            .string("session_id", session_id)
+            .number(
+                "released_count",
+                leases_before
+                    .iter()
+                    .filter(|lease| lease.state == "active")
+                    .count() as u64,
+            )
+            .finish();
+        let leases = self.inventory.release_lease_with_event(
+            session_id,
+            now,
+            EventInput {
+                repository_id: self.repository_record_id()?,
+                worktree_id: Some(session.worktree_id),
+                occurred_at: now,
+                actor,
+                action: "release_lease",
+                result: "succeeded",
+                details_json: &details,
+            },
+        )?;
+        Ok(leases)
+    }
+
+    pub fn release_session(
+        &self,
+        session_id: &str,
+        actor: &str,
+    ) -> Result<Option<SessionRecord>, ServiceError> {
+        let _guard = self.mutation_guard()?;
+        if session_id.trim().is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "session id cannot be empty".to_owned(),
+            ));
+        }
+        let now = unix_now();
+        let existing = self.inventory.session_by_id(session_id)?.ok_or_else(|| {
+            ServiceError::InvalidRequest(format!("session {session_id:?} not found"))
+        })?;
+        let details = json::Object::new()
+            .string("session_id", session_id)
+            .finish();
+        let session = self.inventory.release_session_with_event(
+            session_id,
+            now,
+            EventInput {
+                repository_id: self.repository_record_id()?,
+                worktree_id: Some(existing.worktree_id),
+                occurred_at: now,
+                actor,
+                action: "release_session",
+                result: "succeeded",
+                details_json: &details,
+            },
+        )?;
+        Ok(session)
     }
 
     fn refresh_from_worktrees(
@@ -297,6 +599,13 @@ impl RepositoryService {
         let mut repository = self.repository.clone();
         repository.root = self.primary_root.clone();
         repository
+    }
+
+    fn repository_record_id(&self) -> Result<i64, ServiceError> {
+        Ok(self
+            .inventory
+            .register_repository(&self.inventory_repository(), unix_now())?
+            .id)
     }
 
     pub fn create(&self, request: CreateRequest) -> Result<CreateResult, ServiceError> {
@@ -635,6 +944,14 @@ impl RepositoryService {
     }
 
     pub fn cleanup_scan(&self) -> Result<Vec<CleanupCandidate>, ServiceError> {
+        self.cleanup_scan_with_minimum_age(self.minimum_cleanup_age_seconds)
+    }
+
+    pub fn cleanup_scan_with_minimum_age(
+        &self,
+        minimum_cleanup_age_seconds: i64,
+    ) -> Result<Vec<CleanupCandidate>, ServiceError> {
+        validate_cleanup_age(minimum_cleanup_age_seconds)?;
         let _guard = self.mutation_guard()?;
         let worktrees = self.repository.list_worktrees()?;
         let (_, records) = self.refresh_from_worktrees(&worktrees)?;
@@ -650,7 +967,7 @@ impl RepositoryService {
                 let record = records_by_path
                     .get(&worktree.path.to_string_lossy().into_owned())
                     .copied();
-                self.assess_worktree(worktree, &status, record, now)
+                self.assess_worktree(worktree, &status, record, now, minimum_cleanup_age_seconds)
             })
             .collect()
     }
@@ -661,12 +978,74 @@ impl RepositoryService {
         delete_branch: bool,
         actor: &str,
     ) -> Result<RemoveResult, ServiceError> {
+        self.remove_with_minimum_age(path, delete_branch, actor, self.minimum_cleanup_age_seconds)
+    }
+
+    pub fn remove_with_minimum_age(
+        &self,
+        path: impl AsRef<Path>,
+        delete_branch: bool,
+        actor: &str,
+        minimum_cleanup_age_seconds: i64,
+    ) -> Result<RemoveResult, ServiceError> {
+        validate_cleanup_age(minimum_cleanup_age_seconds)?;
         let _guard = self.mutation_guard()?;
         let requested = absolute_path(path.as_ref())?;
         let worktrees = self.repository.list_worktrees()?;
-        let worktree = find_worktree(&worktrees, &requested)
-            .ok_or_else(|| ServiceError::NotFound(requested.clone()))?
-            .clone();
+        let worktree = match find_worktree(&worktrees, &requested) {
+            Some(worktree) => worktree.clone(),
+            None => {
+                // A daemon can restart after Git removed the directory but before the
+                // inventory response was committed. Reconciliation recognizes the
+                // in-flight remove event and makes a retry idempotently successful.
+                let (repository_record, records) = self.refresh_from_worktrees(&worktrees)?;
+                if let Some(record) = records.iter().find(|record| {
+                    record.path == requested.to_string_lossy()
+                        && record.lifecycle_state == "removed"
+                }) {
+                    let branch = record.branch.clone();
+                    let branch_deleted = if delete_branch {
+                        if let Some(branch) = branch.as_deref() {
+                            let existed = local_branch_exists(&self.primary_root, branch)?;
+                            if existed {
+                                let branch_args = vec![
+                                    OsString::from("branch"),
+                                    OsString::from("-d"),
+                                    OsString::from("--"),
+                                    OsString::from(branch),
+                                ];
+                                run_git(&self.primary_root, &branch_args)?;
+                            }
+                            let details = json::Object::new().string("branch", branch).finish();
+                            self.inventory.record_event(EventInput {
+                                repository_id: repository_record.id,
+                                worktree_id: Some(record.id),
+                                occurred_at: unix_now(),
+                                actor,
+                                action: "delete_branch",
+                                result: if existed {
+                                    "succeeded"
+                                } else {
+                                    "idempotent-replay"
+                                },
+                                details_json: &details,
+                            })?;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    return Ok(RemoveResult {
+                        path: requested,
+                        branch,
+                        branch_deleted,
+                    });
+                }
+                return Err(ServiceError::NotFound(requested));
+            }
+        };
         let (repository_record, records) = self.refresh_from_worktrees(&worktrees)?;
         let record = records
             .iter()
@@ -677,7 +1056,13 @@ impl RepositoryService {
                 )
             })?;
         let status = self.repository.inspect_worktree(&worktree, None);
-        let assessment = self.assess_worktree(&worktree, &status, Some(record), unix_now())?;
+        let assessment = self.assess_worktree(
+            &worktree,
+            &status,
+            Some(record),
+            unix_now(),
+            minimum_cleanup_age_seconds,
+        )?;
         if assessment.classification != "eligible" {
             return Err(ServiceError::UnsafeRemoval {
                 path: requested.clone(),
@@ -730,6 +1115,7 @@ impl RepositoryService {
             &rechecked_status,
             Some(record),
             unix_now(),
+            minimum_cleanup_age_seconds,
         )?;
         if rechecked_assessment.classification != "eligible" {
             let failure_details = json::Object::new()
@@ -848,6 +1234,7 @@ impl RepositoryService {
         status: &GitWorktreeStatus,
         record: Option<&WorktreeRecord>,
         now: i64,
+        minimum_cleanup_age_seconds: i64,
     ) -> Result<CleanupCandidate, ServiceError> {
         let mut blockers = Vec::new();
         let mut classification = "eligible";
@@ -894,10 +1281,10 @@ impl RepositoryService {
         if let Some(record) = record {
             let observed_at = record.created_at.unwrap_or(record.first_seen_at);
             let age_seconds = now.saturating_sub(observed_at);
-            if age_seconds < self.minimum_cleanup_age_seconds {
+            if age_seconds < minimum_cleanup_age_seconds {
                 blockers.push(format!(
                     "worktree age is {age_seconds}s; minimum cleanup age is {}s",
-                    self.minimum_cleanup_age_seconds
+                    minimum_cleanup_age_seconds
                 ));
                 promote_classification(&mut classification, "review");
             }
@@ -949,6 +1336,7 @@ impl RepositoryService {
     }
 
     fn mutation_guard(&self) -> Result<MutationGuard<'_>, ServiceError> {
+        self.inventory.ensure_path_identity()?;
         let thread_guard = self
             .mutation_lock
             .lock()
@@ -981,7 +1369,7 @@ impl RepositoryService {
     }
 }
 
-fn acquire_file_lock(file: &File) -> io::Result<()> {
+pub(crate) fn acquire_file_lock(file: &File) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
@@ -1004,7 +1392,7 @@ fn acquire_file_lock(file: &File) -> io::Result<()> {
     }
 }
 
-fn release_file_lock(file: &File) {
+pub(crate) fn release_file_lock(file: &File) {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
@@ -1053,6 +1441,43 @@ fn validate_create_request(request: &CreateRequest) -> Result<(), ServiceError> 
     {
         return Err(ServiceError::InvalidRequest(
             "idempotency key cannot be empty or contain NUL".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_session_request(request: &RegisterSessionRequest) -> Result<(), ServiceError> {
+    if request.session_id.trim().is_empty() || request.session_id.contains('\0') {
+        return Err(ServiceError::InvalidRequest(
+            "session id cannot be empty or contain NUL".to_owned(),
+        ));
+    }
+    if request.provider.trim().is_empty() || request.provider.contains('\0') {
+        return Err(ServiceError::InvalidRequest(
+            "session provider cannot be empty or contain NUL".to_owned(),
+        ));
+    }
+    if request
+        .provider_session_id
+        .as_deref()
+        .is_some_and(|value| value.contains('\0'))
+        || request
+            .terminal_metadata
+            .as_deref()
+            .is_some_and(|value| value.contains('\0'))
+    {
+        return Err(ServiceError::InvalidRequest(
+            "session metadata cannot contain NUL".to_owned(),
+        ));
+    }
+    if request.lease_ttl_seconds.is_some_and(|ttl| ttl <= 0) {
+        return Err(ServiceError::InvalidRequest(
+            "lease TTL must be positive".to_owned(),
+        ));
+    }
+    if request.pid.is_some_and(|pid| pid <= 0) {
+        return Err(ServiceError::InvalidRequest(
+            "session process id must be positive".to_owned(),
         ));
     }
     Ok(())
@@ -1137,6 +1562,15 @@ fn promote_classification(current: &mut &'static str, candidate: &'static str) {
     }
 }
 
+fn validate_cleanup_age(minimum_cleanup_age_seconds: i64) -> Result<(), ServiceError> {
+    if minimum_cleanup_age_seconds < 0 {
+        return Err(ServiceError::InvalidRequest(
+            "minimum cleanup age cannot be negative".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn classification_priority(classification: &str) -> u8 {
     match classification {
         "in-use" => 4,
@@ -1148,22 +1582,17 @@ fn classification_priority(classification: &str) -> u8 {
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, ServiceError> {
-    if path.is_absolute() {
-        if let Ok(canonical) = fs::canonicalize(path) {
-            return Ok(canonical);
-        }
-        return Ok(path.to_path_buf());
-    }
-    let current = std::env::current_dir().map_err(|source| ServiceError::Io {
-        operation: "resolve current directory".to_owned(),
-        source,
-    })?;
-    let path = current.join(path);
-    if let Ok(canonical) = fs::canonicalize(&path) {
-        Ok(canonical)
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        Ok(path)
-    }
+        std::env::current_dir()
+            .map_err(|source| ServiceError::Io {
+                operation: "resolve current directory".to_owned(),
+                source,
+            })?
+            .join(path)
+    };
+    Ok(canonicalize_with_missing_parent(&absolute).unwrap_or(absolute))
 }
 
 fn find_worktree<'a>(worktrees: &'a [GitWorktree], requested: &Path) -> Option<&'a GitWorktree> {
@@ -1173,14 +1602,29 @@ fn find_worktree<'a>(worktrees: &'a [GitWorktree], requested: &Path) -> Option<&
 }
 
 fn absolute_path_for_compare(path: &Path) -> PathBuf {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        canonical
-    } else if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .map(|current| current.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
+    };
+    canonicalize_with_missing_parent(&absolute).unwrap_or(absolute)
+}
+
+fn canonicalize_with_missing_parent(path: &Path) -> Option<PathBuf> {
+    let mut current = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(current) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+        let name = current.file_name()?.to_owned();
+        missing.push(name);
+        current = current.parent()?;
     }
 }
 
@@ -1210,10 +1654,66 @@ fn run_git(cwd: &Path, args: &[OsString]) -> Result<(), GitError> {
     })
 }
 
+fn local_branch_exists(cwd: &Path, branch: &str) -> Result<bool, GitError> {
+    let args = [
+        OsString::from("show-ref"),
+        OsString::from("--verify"),
+        OsString::from("--quiet"),
+        OsString::from("--"),
+        OsString::from(format!("refs/heads/{branch}")),
+    ];
+    let output = Command::new("git")
+        .args(args.iter())
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PAGER", "cat")
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|source| GitError::Io {
+            operation: format!("check Git branch in {}", cwd.display()),
+            source,
+        })?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    Err(GitError::Command {
+        args: args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+        code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
+}
+
 fn create_details(path: &Path, branch: &str) -> String {
     json::Object::new()
         .string("path", &path.to_string_lossy())
         .string("branch", branch)
+        .finish()
+}
+
+fn session_details(
+    request: &RegisterSessionRequest,
+    path: &Path,
+    lease: Option<&LeaseRecord>,
+) -> String {
+    json::Object::new()
+        .string("session_id", &request.session_id)
+        .string("path", &path.to_string_lossy())
+        .string("provider", &request.provider)
+        .optional_string(
+            "provider_session_id",
+            request.provider_session_id.as_deref(),
+        )
+        .optional_number(
+            "lease_id",
+            lease.and_then(|lease| u64::try_from(lease.id).ok()),
+        )
         .finish()
 }
 
@@ -1227,7 +1727,7 @@ fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateRequest, RepositoryService, ServiceError};
+    use super::{CreateRequest, RegisterSessionRequest, RepositoryService, ServiceError};
     use crate::git::GitRepository;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1310,6 +1810,67 @@ mod tests {
     }
 
     #[test]
+    fn active_session_lease_blocks_removal_until_released() {
+        let directory = temporary_directory();
+        let root = directory.join("repository");
+        initialize_repository(&root);
+        let path = directory.join("leased");
+        let repository = GitRepository::discover(&root).expect("repository discovered");
+        let service = RepositoryService::open_with_minimum_age(
+            repository,
+            directory.join("inventory.sqlite3"),
+            0,
+        )
+        .expect("service opened");
+        let mut create = CreateRequest::new("leased");
+        create.path = Some(path.clone());
+        let created = service.create(create).expect("worktree created");
+
+        let mut session = RegisterSessionRequest::new("session-1", path.clone());
+        session.provider = "test".to_owned();
+        session.lease_ttl_seconds = Some(3600);
+        service
+            .register_session(session)
+            .expect("session registered");
+        let events = service
+            .inventory()
+            .events(created.record.repository_id)
+            .expect("session event listed");
+        assert!(events.iter().any(|event| {
+            event.action == "register_session"
+                && event.details_json.contains("\"lease_id\":")
+                && !event.details_json.contains("\"lease_id\":null")
+        }));
+        let error = service
+            .remove(&path, false, "test")
+            .expect_err("leased worktree should be blocked");
+        match error {
+            ServiceError::UnsafeRemoval { blockers, .. } => {
+                assert!(blockers.iter().any(|blocker| blocker.contains("lease")));
+            }
+            other => panic!("unexpected removal error: {other:?}"),
+        }
+        service
+            .release_session("session-1", "test")
+            .expect("session released");
+        assert!(
+            service
+                .heartbeat_session("session-1", Some(3600), "test")
+                .is_err()
+        );
+        assert!(
+            service
+                .acquire_lease(&path, "session-1", 3600, "test")
+                .is_err()
+        );
+        service
+            .remove(&path, false, "test")
+            .expect("released worktree should be removable");
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn reconciles_an_external_removal_as_missing() {
         let directory = temporary_directory();
         let root = directory.join("repository");
@@ -1343,6 +1904,66 @@ mod tests {
             .find(|record| record.path == created.worktree.path.to_string_lossy())
             .expect("removed worktree remains in inventory");
         assert_eq!(record.lifecycle_state, "missing");
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn retries_an_interrupted_remove_after_git_already_removed_the_worktree() {
+        let directory = temporary_directory();
+        let root = directory.join("repository");
+        initialize_repository(&root);
+        let path = directory.join("interrupted");
+        let repository = GitRepository::discover(&root).expect("repository discovered");
+        let service = RepositoryService::open_with_minimum_age(
+            repository,
+            directory.join("inventory.sqlite3"),
+            0,
+        )
+        .expect("service opened");
+        let mut create = CreateRequest::new("interrupted");
+        create.path = Some(path.clone());
+        let created = service.create(create).expect("worktree created");
+        service
+            .inventory()
+            .record_event(crate::inventory::EventInput {
+                repository_id: created.record.repository_id,
+                worktree_id: Some(created.record.id),
+                occurred_at: 200,
+                actor: "test",
+                action: "remove_worktree",
+                result: "started",
+                details_json: "{}",
+            })
+            .expect("remove start event recorded");
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "remove",
+                "--",
+                path.to_str().expect("path should be UTF-8"),
+            ],
+        );
+        let (_, retry_records) = service.refresh().expect("inventory should reconcile");
+        assert_eq!(
+            retry_records
+                .iter()
+                .find(|record| record.id == created.record.id)
+                .map(|record| record.lifecycle_state.as_str()),
+            Some("removed")
+        );
+
+        let result = service
+            .remove(&path, true, "retry")
+            .expect("interrupted remove should be replayable");
+        assert_eq!(
+            result.path,
+            fs::canonicalize(&directory)
+                .expect("fixture directory should be canonical")
+                .join("interrupted")
+        );
+        assert!(result.branch_deleted);
 
         let _ = fs::remove_dir_all(directory);
     }
