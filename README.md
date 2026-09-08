@@ -2,34 +2,101 @@
 
 Worktree Manager is a local tool for safely creating, inspecting, assigning, and cleaning up Git worktrees used by parallel coding agents.
 
-The first release is intended to be a terminal UI backed by a reusable core service. A desktop GUI can be added later without duplicating Git or process-management logic. The guarded service can run as a local daemon so clients share one serialized SQLite writer.
+The current checkout provides a command-line client, reusable Rust service, SQLite inventory, and local daemon. A terminal UI and agent/provider integrations are planned on top of this core.
 
-The read-only inspection core, guarded lifecycle slice, and local daemon are available as the `wtm` command. It discovers worktrees through Git’s porcelain interface, records repository/worktree facts in a local SQLite inventory, and provides collision-safe create, lock, unlock, cleanup-scan, and non-force remove operations. See the [implementation plan](docs/implementation-plan.md) for the remaining agent and TUI work.
+The tool discovers worktrees through Git’s porcelain interface, records repository/worktree facts in a local SQLite inventory, and provides collision-safe create, lock, unlock, cleanup-scan, and non-force remove operations. See the [implementation plan](docs/implementation-plan.md) for the remaining TUI and agent work.
 
-## Quick start
+## Requirements and build
 
-From a Git repository:
+You need Git and Rust/Cargo. The inventory links against the system SQLite library; macOS provides it, while Linux installations may need their distribution’s SQLite development package.
+
+From this repository:
 
 ```sh
-cargo run -- list
-cargo run -- list --json
-cargo run -- status /path/to/worktree
-cargo run -- status /path/to/worktree --base main --json
-cargo run -- create feature/auth --repo /path/to/repository --path /path/to/feature-auth
-cargo run -- cleanup scan --repo /path/to/repository --json
-cargo run -- remove /path/to/feature-auth --delete-branch --minimum-age-seconds 0
-cargo run -- daemon --repo /path/to/repository --socket /path/to/wtm.sock
+cargo build --release
+./target/release/wtm --help
 ```
 
-`--json` output starts with `schema_version: 1` so scripts can depend on an explicit format version. Lifecycle commands use `.git/worktree-manager.sqlite3` by default. Pass `--db PATH` to place the inventory elsewhere.
+During development, use `cargo run --` in place of `./target/release/wtm`.
+
+## Usage
+
+Run read-only commands from a repository or pass `--repo PATH` explicitly:
+
+```sh
+./target/release/wtm list
+./target/release/wtm list --repo /path/to/repository --json
+./target/release/wtm status /path/to/worktree --base main
+```
+
+Create and protect a worktree:
+
+```sh
+./target/release/wtm create feature/auth \
+  --repo /path/to/repository \
+  --path /path/to/feature-auth \
+  --base main \
+  --idempotency-key feature-auth-001
+
+./target/release/wtm lock /path/to/feature-auth --reason "agent is using this"
+./target/release/wtm unlock /path/to/feature-auth
+```
+
+Inspect cleanup candidates and remove a worktree:
+
+```sh
+./target/release/wtm cleanup scan --repo /path/to/repository --json
+./target/release/wtm remove /path/to/feature-auth --repo /path/to/repository
+./target/release/wtm remove /path/to/feature-auth \
+  --repo /path/to/repository \
+  --delete-branch \
+  --minimum-age-seconds 0
+```
+
+`--json` output starts with `schema_version: 1`, so scripts can depend on an explicit format version. Lifecycle commands use `.git/worktree-manager.sqlite3` by default. Pass `--db PATH` to place the inventory elsewhere.
 
 Creation accepts `--idempotency-key KEY`; repeated requests with the same key reuse the recorded worktree rather than creating another one. Cleanup and removal require a 24-hour minimum age by default; use `--minimum-age-seconds N` when a repository-specific policy calls for a different threshold. Removal is conservative: dirty, conflicted, locked, leased, in-use, unmerged, unavailable, or ambiguous worktrees are blocked, and branch deletion is a separate explicit `--delete-branch` action.
 
-Mutating CLI commands start or reuse the local daemon and route their database/Git writes through it. Use `--socket PATH` on a mutating command when the daemon was started with a custom socket, or run the daemon explicitly first. `wtm daemon` serves versioned JSON-lines requests over a Unix socket. Its request journal replays completed responses and retries interrupted requests by request ID, while startup reconciliation refreshes Git before accepting work. The daemon also exposes session registration, heartbeats, exclusive renewable leases, and session/lease release operations for future agent adapters. Use a short socket path on systems with strict Unix socket path limits.
+## Daemon and crash recovery
 
-If a daemon crashes after Git has removed a worktree, retry the same command so the request journal can reconcile and replay it; if the worktree path no longer lets Git discover the repository, add `--repo PATH` to `wtm remove`. Multiple daemon processes sharing one inventory serialize their request journal through a database-scoped lock.
+Mutating CLI commands automatically start or reuse the local daemon and route their database/Git writes through it. To run one explicitly:
 
-The inventory links against the system SQLite library; macOS provides it, while Linux installations may need their distribution’s SQLite development package.
+```sh
+./target/release/wtm daemon \
+  --repo /path/to/repository \
+  --db /path/to/repository/.git/worktree-manager.sqlite3 \
+  --socket /tmp/wtm.sock
+```
+
+When using a custom socket, pass it to mutating commands too:
+
+```sh
+./target/release/wtm create feature/auth \
+  --repo /path/to/repository \
+  --socket /tmp/wtm.sock
+```
+
+The daemon serves versioned JSON-lines requests over a Unix socket. Its request journal replays completed responses and retries interrupted requests by request ID. Startup reconciliation refreshes Git before accepting work, and sessions can register, heartbeat, acquire renewable exclusive leases, and release them. The session/lease backend is implemented for future adapters; user-facing `wtm agent` commands are not available yet. Use a short socket path on systems with strict Unix socket path limits.
+
+If a daemon crashes after Git has removed a worktree, retry the same command so the request journal can reconcile and replay it. If the worktree path no longer lets Git discover the repository, add `--repo PATH` to `wtm remove`. Multiple daemon processes sharing one inventory serialize their request journal through database-scoped locks. Mutations also verify the inventory identity and recover from replacement of the database file.
+
+## Implemented and remaining
+
+Implemented:
+
+- Worktree discovery, status inspection, JSON output, and merge/dirty-state reporting.
+- Collision-safe create, Git lock/unlock, cleanup assessment, and conservative removal.
+- SQLite inventory, lifecycle events, reservations, sessions, and leases.
+- Daemon IPC, centralized mutation writes, idempotent request journaling, retries, and crash recovery.
+
+Next planned slice:
+
+- TUI and service read model with filtering, details, cleanup preview, confirmations, and live refresh.
+- Provider-neutral session adapters for launching, discovering, attaching to, messaging, and stopping sessions.
+- Initial generic-terminal, `tmux`, and Codex adapters.
+- User-facing `wtm tui`, `wtm agent ...`, and `wtm doctor` commands.
+
+Later work includes archive/export-before-delete, filesystem watching, policy configuration, scheduled cleanup, desktop GUI support, remote worktrees, team-shared leases, and PR/CI integrations. See the [implementation plan](docs/implementation-plan.md) for the full roadmap.
 
 ## Intended outcomes
 
